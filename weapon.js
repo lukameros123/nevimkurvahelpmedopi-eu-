@@ -11,9 +11,9 @@ export class WeaponSystem {
     this.actions    = {};
     this.loaded     = false;
 
-    // CS2-like weapon offset (right-hand carry position)
-    this.baseOffset = new THREE.Vector3(0.22, -0.26, -0.42);
-    this.baseRot    = new THREE.Euler(0.04, 0.08, 0.0);
+    // CS2-like weapon offset — right hand, barrel visible, nothing cut off
+    this.baseOffset = new THREE.Vector3(0.14, -0.22, -0.38);
+    this.baseRot    = new THREE.Euler(0.02, 0.06, 0.0);
 
     // Sway / bob state
     this.swayX      = 0;
@@ -40,7 +40,7 @@ export class WeaponSystem {
 
   _setupWeaponCamera() {
     // Separate camera for weapon — prevents clipping into walls
-    this.weaponCam = new THREE.PerspectiveCamera(65, window.innerWidth / window.innerHeight, 0.01, 20);
+    this.weaponCam = new THREE.PerspectiveCamera(54, window.innerWidth / window.innerHeight, 0.005, 20);
     this.weaponScene = new THREE.Scene();
 
     // Lighting in weapon scene
@@ -220,22 +220,19 @@ export class WeaponSystem {
 
   // ── SHOOT ──────────────────────────────────────────────────
   shoot() {
-    if (this.isShooting || this.isReloading || this.ammo <= 0) {
+    if (this.isReloading || this.ammo <= 0) {
       if (this.ammo <= 0) this.reload();
       return false;
     }
 
     this.ammo--;
-    this.isShooting  = true;
-    this.recoilKick  = 1.0;
-    this.recoilSide  += (Math.random() - 0.5) * 0.6;
+    this.recoilKick  = Math.min(this.recoilKick + 0.5, 2.0);
+    this.recoilSide += (Math.random() - 0.5) * 0.5;
 
+    // Full auto — restart anim every shot
     if (this.actions.shoot) {
       if (this.actions.idle) this.actions.idle.stop();
       this.actions.shoot.reset().play();
-    } else {
-      // No animation found → fake timing
-      setTimeout(() => { this.isShooting = false; }, 80);
     }
 
     return true;
@@ -269,7 +266,7 @@ export class WeaponSystem {
   syncCamera() {
     if (!this.weaponCam) return;
     this.weaponCam.aspect = this.camera.aspect;
-    this.weaponCam.fov    = this.camera.fov * 0.88; // slightly zoomed for CS2 look
+    this.weaponCam.fov    = 54;
     this.weaponCam.updateProjectionMatrix();
   }
 

@@ -171,24 +171,42 @@ export class Game {
       const k = e.key.toLowerCase();
       this._keys[k] = true;
       if (k === 'r') this.weapon.reload();
+      e.preventDefault();
     });
-    document.addEventListener('keyup',   e => { this._keys[e.key.toLowerCase()] = false; });
+    document.addEventListener('keyup', e => {
+      this._keys[e.key.toLowerCase()] = false;
+    });
 
+    // Mouse move — accumulate raw movement, works with pointer lock
     document.addEventListener('mousemove', e => {
-      if (!document.pointerLockElement) return;
-      this._mouse.dx += e.movementX;
-      this._mouse.dy += e.movementY;
+      this._mouse.dx += e.movementX || e.mozMovementX || 0;
+      this._mouse.dy += e.movementY || e.mozMovementY || 0;
     });
 
     document.addEventListener('mousedown', e => {
-      if (e.button === 0 && document.pointerLockElement) {
+      if (e.button === 0) {
         this._keys['lmb'] = true;
+        // Request pointer lock on first click
+        if (!document.pointerLockElement) {
+          this.canvas.requestPointerLock();
+        }
       }
     });
-    document.addEventListener('mouseup',   e => { if (e.button === 0) this._keys['lmb'] = false; });
+    document.addEventListener('mouseup', e => {
+      if (e.button === 0) this._keys['lmb'] = false;
+    });
+
+    // Pointer lock change
+    document.addEventListener('pointerlockchange', () => {
+      if (document.pointerLockElement === this.canvas) {
+        console.log('Pointer locked ✓');
+      }
+    });
 
     this.canvas.addEventListener('click', () => {
-      if (this.running) this.canvas.requestPointerLock();
+      if (this.running && !document.pointerLockElement) {
+        this.canvas.requestPointerLock();
+      }
     });
 
     window.addEventListener('resize', () => {
@@ -236,19 +254,18 @@ export class Game {
   _updatePlayer(delta) {
     const k = this._keys;
 
-    // Mouse look
-    if (document.pointerLockElement) {
-      const sens = 0.0018;
-      this.yaw   -= this._mouse.dx * sens;
-      this.pitch -= this._mouse.dy * sens;
-      this.pitch  = THREE.MathUtils.clamp(this.pitch, -Math.PI * 0.48, Math.PI * 0.48);
-    }
+    // Apply accumulated mouse delta every frame (pointer lock moves are already raw)
+    const sens = 0.0020;
+    this.yaw   -= this._mouse.dx * sens;
+    this.pitch -= this._mouse.dy * sens;
+    this.pitch  = THREE.MathUtils.clamp(this.pitch, -Math.PI * 0.46, Math.PI * 0.46);
 
     this.camera.rotation.order = 'YXZ';
     this.camera.rotation.y     = this.yaw;
     this.camera.rotation.x     = this.pitch;
 
     // Sync weapon camera rotation
+    this.weapon.weaponCam.rotation.order = 'YXZ';
     this.weapon.weaponCam.rotation.copy(this.camera.rotation);
 
     // Move
