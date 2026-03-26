@@ -110,10 +110,8 @@ export class Game {
   _makeEnemy(x, y, z) {
     const group = new THREE.Group();
 
-    // Body
-    const bodyGeo = new THREE.CapsuleGeometry
-      ? new THREE.CapsuleGeometry(0.35, 1.0, 4, 8)
-      : new THREE.CylinderGeometry(0.35, 0.35, 1.4, 8);
+    // Body (CapsuleGeometry not in r128, use Cylinder + Spheres)
+    const bodyGeo = new THREE.CylinderGeometry(0.32, 0.32, 1.1, 10);
     const bodyMat = new THREE.MeshStandardMaterial({ color: 0x2d5a1b, roughness: 0.8 });
     const body    = new THREE.Mesh(bodyGeo, bodyMat);
     body.castShadow = true;
