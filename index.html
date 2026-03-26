@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="cs">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>CS2 Web — AK-47</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { background: #000; overflow: hidden; font-family: 'Segoe UI', sans-serif; }
+    #canvas { display: block; width: 100vw; height: 100vh; }
+
+    /* ── OVERLAY ── */
+    #overlay {
+      position: fixed; inset: 0; z-index: 100;
+      background: radial-gradient(ellipse at center, #1a1a2e 0%, #000 100%);
+      display: flex; flex-direction: column;
+      align-items: center; justify-content: center; gap: 24px;
+      transition: opacity .4s;
+    }
+    #overlay h1 {
+      font-size: 72px; font-weight: 900; letter-spacing: 8px; color: #fff;
+      text-transform: uppercase;
+      text-shadow: 0 0 40px #f5a623, 0 0 80px #f5a62366;
+    }
+    #overlay .sub {
+      color: #aaa; font-size: 14px; letter-spacing: 3px; text-transform: uppercase;
+    }
+    #overlay .keys {
+      display: grid; grid-template-columns: repeat(2,1fr); gap: 8px 32px;
+      color: #888; font-size: 13px; margin-top: 12px;
+    }
+    #overlay .keys span { color: #f5a623; }
+    #startBtn {
+      margin-top: 24px; padding: 14px 56px;
+      background: #f5a623; color: #000; border: none;
+      font-size: 18px; font-weight: 700; letter-spacing: 3px;
+      text-transform: uppercase; cursor: pointer;
+      clip-path: polygon(8px 0,100% 0,calc(100% - 8px) 100%,0 100%);
+      transition: transform .15s, background .15s;
+    }
+    #startBtn:hover { background: #ffc04d; transform: scale(1.04); }
+
+    /* ── LOADING ── */
+    #loading {
+      position: fixed; inset: 0; z-index: 200;
+      background: #000; display: flex; flex-direction: column;
+      align-items: center; justify-content: center; gap: 16px;
+      color: #fff; font-size: 16px; letter-spacing: 2px;
+    }
+    #loadBar { width: 300px; height: 3px; background: #222; }
+    #loadFill { height: 100%; background: #f5a623; width: 0%; transition: width .3s; }
+    #loading.hidden { display: none; }
+
+    /* ── PAUSED ── */
+    #paused {
+      position: fixed; inset: 0; z-index: 99;
+      background: rgba(0,0,0,.6); backdrop-filter: blur(4px);
+      display: none; align-items: center; justify-content: center;
+      color: #fff; font-size: 32px; letter-spacing: 6px; text-transform: uppercase;
+    }
+    #paused.show { display: flex; }
+  </style>
+</head>
+<body>
+
+<!-- Loading -->
+<div id="loading">
+  <div>Načítám model…</div>
+  <div id="loadBar"><div id="loadFill"></div></div>
+</div>
+
+<!-- Main overlay -->
+<div id="overlay">
+  <h1>AK-47</h1>
+  <div class="sub">Counter-Strike 2 — Web Edition</div>
+  <div class="keys">
+    <div><span>WASD</span> — pohyb</div>
+    <div><span>LMB</span> — střelba</div>
+    <div><span>SHIFT</span> — chůze</div>
+    <div><span>R</span> — reload</div>
+    <div><span>SPACE</span> — skok</div>
+    <div><span>ESC</span> — pauza</div>
+  </div>
+  <button id="startBtn">HRÁT</button>
+</div>
+
+<!-- Paused -->
+<div id="paused">⏸ PAUZA — klikni pro pokračování</div>
+
+<canvas id="canvas"></canvas>
+
+<!-- Three.js + GLTFLoader via CDN -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/loaders/GLTFLoader.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/loaders/DRACOLoader.js"></script>
+
+<script type="module">
+  import { buildMap }    from './map.js';
+  import { WeaponSystem } from './weapon.js';
+  import { HUD }          from './hud.js';
+  import { Game }         from './game.js';
+
+  const loadFill = document.getElementById('loadFill');
+  const loading  = document.getElementById('loading');
+  const overlay  = document.getElementById('overlay');
+  const startBtn = document.getElementById('startBtn');
+  const paused   = document.getElementById('paused');
+
+  // Progress callback
+  function onProgress(p) {
+    loadFill.style.width = (p * 100) + '%';
+  }
+
+  // Boot
+  const game = new Game({
+    canvas:   document.getElementById('canvas'),
+    onProgress,
+    onReady() {
+      loading.classList.add('hidden');
+    }
+  });
+
+  startBtn.addEventListener('click', () => {
+    overlay.style.opacity = '0';
+    setTimeout(() => { overlay.style.display = 'none'; }, 400);
+    game.start();
+  });
+
+  document.addEventListener('pointerlockchange', () => {
+    if (!document.pointerLockElement) {
+      paused.classList.add('show');
+    } else {
+      paused.classList.remove('show');
+    }
+  });
+
+  paused.addEventListener('click', () => {
+    document.getElementById('canvas').requestPointerLock();
+  });
+
+  window._game = game; // debug
+</script>
+</body>
+</html>
