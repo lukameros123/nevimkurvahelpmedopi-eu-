@@ -1,66 +1,46 @@
-// weapon.js — GLB loader, CS2 weapon hold, animations
+// weapon.js — AK-47 GLB, morph-target anim, CS2 hold, fake reload
 
 export class WeaponSystem {
-  constructor({ scene, camera, onProgress }) {
-    this.scene      = scene;
+  constructor({ camera, onProgress }) {
     this.camera     = camera;
     this.onProgress = onProgress;
 
-    this.model      = null;
-    this.mixer      = null;
-    this.actions    = {};
-    this.loaded     = false;
+    this.model   = null;
+    this.mixer   = null;
+    this.actions = {};
+    this.loaded  = false;
 
-    // CS2-like weapon offset — right hand, barrel visible, nothing cut off
-    this.baseOffset = new THREE.Vector3(0.14, -0.22, -0.38);
-    this.baseRot    = new THREE.Euler(0.02, 0.06, 0.0);
-
-    // Sway / bob state
-    this.swayX      = 0;
-    this.swayY      = 0;
-    this.swayTargX  = 0;
-    this.swayTargY  = 0;
-    this.bobTime    = 0;
-    this.isMoving   = false;
-
-    // Recoil
-    this.recoilKick  = 0;
-    this.recoilSide  = 0;
-
-    // State
-    this.isShooting  = false;
-    this.isReloading = false;
     this.ammo        = 30;
     this.maxAmmo     = 30;
     this.reserve     = 90;
+    this.isReloading = false;
+    this._reloadT    = 0;
 
-    // Weapon camera (renders on top)
-    this._setupWeaponCamera();
-  }
+    this.recoilKick = 0;
+    this.recoilSide = 0;
+    this.swayX = 0;
+    this.swayY = 0;
+    this.bobTime = 0;
 
-  _setupWeaponCamera() {
-    // Separate camera for weapon — prevents clipping into walls
-    this.weaponCam = new THREE.PerspectiveCamera(54, window.innerWidth / window.innerHeight, 0.005, 20);
+    this.basePos = new THREE.Vector3(0.18, -0.28, -0.45);
+    this.baseRot = new THREE.Euler(0.0, 0.05, 0.0);
+
+    // Dedicated weapon scene
     this.weaponScene = new THREE.Scene();
+    this.weaponCam   = new THREE.PerspectiveCamera(55, window.innerWidth / window.innerHeight, 0.001, 30);
 
-    // Lighting in weapon scene
-    const amb = new THREE.AmbientLight(0xfff4e0, 1.2);
-    this.weaponScene.add(amb);
-
-    const dir = new THREE.DirectionalLight(0xffffff, 1.5);
-    dir.position.set(1, 2, 1);
-    this.weaponScene.add(dir);
-
-    const fill = new THREE.DirectionalLight(0xadd8ff, 0.4);
-    fill.position.set(-1, 0, 1);
+    this.weaponScene.add(new THREE.AmbientLight(0xfff4e0, 1.5));
+    const sun = new THREE.DirectionalLight(0xffffff, 2.0);
+    sun.position.set(1, 3, 2);
+    this.weaponScene.add(sun);
+    const fill = new THREE.DirectionalLight(0xaad4ff, 0.6);
+    fill.position.set(-2, 0, 1);
     this.weaponScene.add(fill);
   }
 
-  load(glbUrl) {
+  load(url) {
     return new Promise((resolve, reject) => {
       const loader = new THREE.GLTFLoader();
-
-      // Try DRACOLoader if available
       try {
         const draco = new THREE.DRACOLoader();
         draco.setDecoderPath('https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/libs/draco/');
@@ -68,14 +48,10 @@ export class WeaponSystem {
       } catch(e) {}
 
       loader.load(
-        glbUrl,
-        (gltf) => this._onLoad(gltf, resolve),
-        (xhr)  => {
-          if (xhr.lengthComputable) {
-            this.onProgress(xhr.loaded / xhr.total);
-          }
-        },
-        reject
+        url,
+        gltf => this._onLoad(gltf, resolve),
+        xhr  => { if (xhr.lengthComputable) this.onProgress(xhr.loaded / xhr.total); },
+        err  => { console.error('GLB error:', err); reject(err); }
       );
     });
   }
@@ -83,195 +59,143 @@ export class WeaponSystem {
   _onLoad(gltf, resolve) {
     this.model = gltf.scene;
 
-    // ── Scale & orient to CS2 style ─────────────────────────
-    this.model.scale.setScalar(1.0);
-    this.model.rotation.set(0, 0, 0);
-
-    // Traverse materials — make them look sharp
     this.model.traverse(child => {
-      if (child.isMesh) {
-        child.castShadow    = false;
-        child.receiveShadow = false;
-        child.frustumCulled = false;
-
-        if (child.material) {
-          const m = Array.isArray(child.material) ? child.material : [child.material];
-          m.forEach(mat => {
-            mat.depthTest  = true;
-            mat.depthWrite = true;
-            // Slight roughness boost for realism
-            if (mat.roughness !== undefined) mat.roughness = Math.max(mat.roughness, 0.35);
-          });
-        }
-      }
+      if (!child.isMesh) return;
+      child.frustumCulled = false;
+      child.castShadow    = false;
+      const mats = Array.isArray(child.material) ? child.material : [child.material];
+      mats.forEach(m => {
+        m.depthTest  = true;
+        m.depthWrite = true;
+        if (m.roughness !== undefined) m.roughness = Math.max(m.roughness, 0.3);
+      });
     });
 
-    this.weaponScene.add(this.model);
+    // Auto-fit bounding box
+    const box    = new THREE.Box3().setFromObject(this.model);
+    const size   = new THREE.Vector3();
+    const center = new THREE.Vector3();
+    box.getSize(size);
+    box.getCenter(center);
 
-    // ── Animations ───────────────────────────────────────────
+    const maxDim = Math.max(size.x, size.y, size.z);
+    const scale  = 0.55 / maxDim;
+    this.model.scale.setScalar(scale);
+    this.model.position.sub(center.multiplyScalar(scale));
+
+    console.log('[Weapon] loaded, scale=' + scale.toFixed(3) + ' size=' + size.x.toFixed(2) + 'x' + size.y.toFixed(2) + 'x' + size.z.toFixed(2));
+
+    // Animation (morph target 'Object_0' = shoot)
     if (gltf.animations && gltf.animations.length > 0) {
       this.mixer = new THREE.AnimationMixer(this.model);
-
-      gltf.animations.forEach(clip => {
-        const name   = clip.name.toLowerCase();
-        const action = this.mixer.clipAction(clip);
-
-        if (name.includes('shoot') || name.includes('fire') || name.includes('attack')) {
-          action.setLoop(THREE.LoopOnce, 1);
-          action.clampWhenFinished = true;
-          this.actions.shoot = action;
-        } else if (name.includes('reload')) {
-          action.setLoop(THREE.LoopOnce, 1);
-          action.clampWhenFinished = true;
-          this.actions.reload = action;
-        } else if (name.includes('idle') || name.includes('walk')) {
-          action.setLoop(THREE.LoopRepeat, Infinity);
-          this.actions.idle = action;
-        } else {
-          // First unknown anim → treat as shoot
-          if (!this.actions.shoot) {
-            action.setLoop(THREE.LoopOnce, 1);
-            action.clampWhenFinished = true;
-            this.actions.shoot = action;
-          }
-        }
-      });
-
-      // Mixer event — animation finished
-      this.mixer.addEventListener('finished', (e) => {
-        const which = e.action;
-        if (which === this.actions.shoot) {
-          this.isShooting = false;
-        }
-        if (which === this.actions.reload) {
-          this.isReloading = false;
-          const needed = this.maxAmmo - this.ammo;
-          const take   = Math.min(needed, this.reserve);
-          this.ammo    += take;
-          this.reserve -= take;
-        }
-        // Return to idle
-        if (this.actions.idle) {
-          this.actions.idle.reset().play();
-        }
-      });
-
-      // Start idle
-      if (this.actions.idle) this.actions.idle.play();
+      const clip   = gltf.animations[0];
+      const action = this.mixer.clipAction(clip);
+      action.setLoop(THREE.LoopOnce, 1);
+      action.clampWhenFinished = true;
+      action.timeScale = 2.0;
+      this.actions.shoot = action;
     }
 
+    this.weaponScene.add(this.model);
     this.loaded = true;
-    this._applyHoldPosition();
+    this._positionModel();
     resolve(this);
   }
 
-  _applyHoldPosition() {
+  _positionModel() {
     if (!this.model) return;
-    this.model.position.copy(this.baseOffset);
+    this.model.position.add(this.basePos);
     this.model.rotation.copy(this.baseRot);
   }
 
-  // ── Called each frame ─────────────────────────────────────
-  update(delta, keys, mouseDelta) {
+  update(delta, keys, mouse) {
     if (!this.model) return;
+    const { dx = 0, dy = 0 } = mouse || {};
+    const moving = keys.w || keys.s || keys.a || keys.d;
 
-    const { dx = 0, dy = 0 } = mouseDelta || {};
-    this.isMoving = keys.w || keys.s || keys.a || keys.d;
+    // Sway
+    const swayTargX = THREE.MathUtils.clamp(-dx * 0.0005, -0.04, 0.04);
+    const swayTargY = THREE.MathUtils.clamp(-dy * 0.0005, -0.03, 0.03);
+    const lp = 1 - Math.exp(-10 * delta);
+    this.swayX = THREE.MathUtils.lerp(this.swayX, swayTargX, lp);
+    this.swayY = THREE.MathUtils.lerp(this.swayY, swayTargY, lp);
 
-    // ── Sway (mouse look follow) ──────────────────────────
-    this.swayTargX = -dx * 0.0006;
-    this.swayTargY = -dy * 0.0006;
-    this.swayTargX = THREE.MathUtils.clamp(this.swayTargX, -0.05, 0.05);
-    this.swayTargY = THREE.MathUtils.clamp(this.swayTargY, -0.04, 0.04);
-
-    const lerpF = 1 - Math.exp(-12 * delta);
-    this.swayX = THREE.MathUtils.lerp(this.swayX, this.swayTargX, lerpF);
-    this.swayY = THREE.MathUtils.lerp(this.swayY, this.swayTargY, lerpF);
-
-    // ── Movement bob ──────────────────────────────────────
+    // Bob
     let bobX = 0, bobY = 0;
-    if (this.isMoving) {
-      this.bobTime += delta * 8;
-      bobX = Math.sin(this.bobTime) * 0.015;
-      bobY = Math.abs(Math.sin(this.bobTime)) * 0.012;
-    } else {
-      this.bobTime = 0;
+    if (moving) {
+      this.bobTime += delta * 7.5;
+      bobX = Math.sin(this.bobTime)           * 0.012;
+      bobY = Math.abs(Math.sin(this.bobTime)) * 0.010;
     }
 
-    // ── Recoil decay ──────────────────────────────────────
-    this.recoilKick = THREE.MathUtils.lerp(this.recoilKick, 0, 1 - Math.exp(-10 * delta));
-    this.recoilSide = THREE.MathUtils.lerp(this.recoilSide, 0, 1 - Math.exp(-8 * delta));
+    // Recoil decay
+    const rd = 1 - Math.exp(-9 * delta);
+    this.recoilKick = THREE.MathUtils.lerp(this.recoilKick, 0, rd);
+    this.recoilSide = THREE.MathUtils.lerp(this.recoilSide, 0, rd * 0.7);
 
-    // ── Apply to model ────────────────────────────────────
+    // Reload procedural anim
+    let reloadOffY = 0, reloadRot = 0;
+    if (this.isReloading) {
+      this._reloadT += delta;
+      const t = this._reloadT;
+      if (t < 0.35) {
+        reloadOffY = -(t / 0.35) * 0.22;
+        reloadRot  =  (t / 0.35) * 0.4;
+      } else if (t < 1.7) {
+        reloadOffY = -0.22;
+        reloadRot  =  0.4;
+      } else if (t < 2.2) {
+        const f    = (t - 1.7) / 0.5;
+        reloadOffY = THREE.MathUtils.lerp(-0.22, 0, f);
+        reloadRot  = THREE.MathUtils.lerp(0.4,  0, f);
+      } else {
+        this.isReloading = false;
+        this._reloadT    = 0;
+        const take = Math.min(this.maxAmmo - this.ammo, this.reserve);
+        this.ammo    += take;
+        this.reserve -= take;
+      }
+    }
+
     this.model.position.set(
-      this.baseOffset.x + this.swayX + bobX + this.recoilSide * 0.02,
-      this.baseOffset.y + this.swayY + bobY - this.recoilKick * 0.04,
-      this.baseOffset.z
+      this.basePos.x + this.swayX + bobX + this.recoilSide * 0.015,
+      this.basePos.y + this.swayY + bobY - this.recoilKick * 0.035 + reloadOffY,
+      this.basePos.z
     );
     this.model.rotation.set(
-      this.baseRot.x - this.recoilKick * 0.06 + bobY * 0.5,
-      this.baseRot.y + this.swayX * 2,
-      this.baseRot.z + this.swayX * 0.5 + bobX * 0.5
+      this.baseRot.x - this.recoilKick * 0.05 + reloadRot,
+      this.baseRot.y + this.swayX * 1.5,
+      this.baseRot.z + this.swayX * 0.4 + bobX * 0.3
     );
 
-    // Animate mixer
     if (this.mixer) this.mixer.update(delta);
   }
 
-  // ── SHOOT ──────────────────────────────────────────────────
   shoot() {
-    if (this.isReloading || this.ammo <= 0) {
-      if (this.ammo <= 0) this.reload();
-      return false;
-    }
-
+    if (this.isReloading) return false;
+    if (this.ammo <= 0) { this.reload(); return false; }
     this.ammo--;
-    this.recoilKick  = Math.min(this.recoilKick + 0.5, 2.0);
-    this.recoilSide += (Math.random() - 0.5) * 0.5;
-
-    // Full auto — restart anim every shot
-    if (this.actions.shoot) {
-      if (this.actions.idle) this.actions.idle.stop();
-      this.actions.shoot.reset().play();
-    }
-
+    this.recoilKick  = Math.min(this.recoilKick + 0.6, 2.2);
+    this.recoilSide += (Math.random() - 0.5) * 0.45;
+    if (this.actions.shoot) this.actions.shoot.reset().play();
     return true;
   }
 
-  // ── RELOAD ────────────────────────────────────────────────
   reload() {
     if (this.isReloading || this.ammo === this.maxAmmo || this.reserve <= 0) return;
-
     this.isReloading = true;
-
-    if (this.actions.shoot) this.actions.shoot.stop();
-    if (this.actions.idle)  this.actions.idle.stop();
-
-    if (this.actions.reload) {
-      this.actions.reload.reset().play();
-    } else {
-      // Fake reload
-      setTimeout(() => {
-        this.isReloading = false;
-        const needed     = this.maxAmmo - this.ammo;
-        const take       = Math.min(needed, this.reserve);
-        this.ammo       += take;
-        this.reserve    -= take;
-        if (this.actions.idle) this.actions.idle.reset().play();
-      }, 2000);
-    }
+    this._reloadT    = 0;
   }
 
-  // Weapon camera follows main camera rotation (but NOT position — fixed in view)
   syncCamera() {
-    if (!this.weaponCam) return;
     this.weaponCam.aspect = this.camera.aspect;
-    this.weaponCam.fov    = 54;
     this.weaponCam.updateProjectionMatrix();
   }
 
   renderWeapon(renderer) {
     if (!this.model) return;
+    this.weaponCam.rotation.order = 'YXZ';
+    this.weaponCam.rotation.copy(this.camera.rotation);
     renderer.autoClear = false;
     renderer.clearDepth();
     renderer.render(this.weaponScene, this.weaponCam);
