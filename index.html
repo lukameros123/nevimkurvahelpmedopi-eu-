@@ -26,6 +26,14 @@
   #sbButtons button{background:#111;border:3px solid #d20b1c;color:#fff;font:22px Impact,Arial Black,sans-serif;padding:10px 28px;cursor:pointer;}
   #sbButtons button:hover{background:#250006;}
   #sbHint{margin-top:12px;color:#aaa;font:13px Arial,sans-serif;text-align:center;line-height:1.35;}
+  #nickConfig{position:fixed;inset:0;display:none;place-items:center;background:rgba(0,0,0,.86);z-index:11;font-family:Impact,Arial Black,Arial,sans-serif;}
+  #nickConfig.show{display:grid;}
+  #nickBox{width:min(560px,90vw);background:#080808;border:4px solid #d20b1c;box-shadow:0 0 42px #000;padding:24px;color:#fff;}
+  #nickBox h2{margin:0 0 18px 0;text-align:center;font-size:42px;letter-spacing:1px;}
+  #nickBox input{width:100%;box-sizing:border-box;background:#111;border:2px solid #555;color:#fff;padding:14px;font:22px Impact,Arial Black,sans-serif;text-align:center;outline:none;}
+  #nickBox input:focus{border-color:#d20b1c;}
+  #nickBox button{margin:18px auto 0;display:block;background:#111;border:3px solid #d20b1c;color:#fff;font:25px Impact,Arial Black,sans-serif;padding:10px 38px;cursor:pointer;}
+  #nickBox button:hover{background:#250006;}
 </style>
 </head>
 <body>
@@ -44,6 +52,13 @@
     <div id="sbHint">Uloží se do localStorage. Online místnosti pak pojedou přes Supabase Realtime.</div>
   </div>
 </div>
+<div id="nickConfig">
+  <div id="nickBox">
+    <h2>ZADEJ NICK</h2>
+    <input id="nickInput" maxlength="18" spellcheck="false" autocomplete="off" />
+    <button id="nickSave" type="button">ULOŽIT</button>
+  </div>
+</div>
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 <script>
 (() => {
@@ -54,6 +69,9 @@ const sbUrlInput = document.getElementById('sbUrl');
 const sbKeyInput = document.getElementById('sbKey');
 const sbSaveBtn = document.getElementById('sbSave');
 const sbCloseBtn = document.getElementById('sbClose');
+const nickConfigEl = document.getElementById('nickConfig');
+const nickInput = document.getElementById('nickInput');
+const nickSaveBtn = document.getElementById('nickSave');
 const ctx = canvas.getContext('2d');
 ctx.imageSmoothingEnabled = true;
 try { ctx.imageSmoothingQuality = 'high'; } catch(e) {}
@@ -62,7 +80,8 @@ const W = canvas.width, H = canvas.height;
 const keys = Object.create(null);
 const mouse = {x: W/2, y: H/2, down:false, worldX:0, worldY:0};
 let last = performance.now();
-let state = 'menu';
+let state = 'loading';
+let loadingTimer = 1.65;
 let menuStep = 'main';
 let searchTimer = 0;
 let roomCreated = false;
@@ -88,8 +107,8 @@ const online = {
   active:false,
   searching:false,
   isHost:false,
-  clientId:'p_' + Math.random().toString(36).slice(2,10),
-  playerName:'HRÁČ ' + Math.random().toString(36).slice(2,5).toUpperCase(),
+  clientId: localStorage.getItem('echo_noir_account_id') || ('p_' + Math.random().toString(36).slice(2,10)),
+  playerName: localStorage.getItem('echo_noir_player_nick') || '',
   roomId:null,
   roomCode:null,
   roomChannel:null,
@@ -101,6 +120,8 @@ const online = {
   lastStatus:'OFFLINE',
   missionSeed:0
 };
+if(!localStorage.getItem('echo_noir_account_id')) localStorage.setItem('echo_noir_account_id', online.clientId);
+if(!localStorage.getItem('echo_noir_db_ready')) localStorage.setItem('echo_noir_db_ready','0');
 
 const rand = (a,b)=>a+Math.random()*(b-a);
 const clamp = (v,a,b)=>Math.max(a,Math.min(b,v));
@@ -166,6 +187,45 @@ function playMusic(){
 
 function stopMusic(){
   try{ if(musicAudio){ musicAudio.pause(); musicAudio.currentTime = 0; } }catch(e){}
+}
+
+function getPlayerNick(){
+  return (localStorage.getItem('echo_noir_player_nick') || '').trim();
+}
+function setPlayerNick(nick){
+  const clean = String(nick || '').trim().slice(0,18) || ('HRÁČ ' + online.clientId.slice(-4).toUpperCase());
+  localStorage.setItem('echo_noir_player_nick', clean);
+  online.playerName = clean;
+  saveProgress();
+  saveAccountToSupabase();
+  return clean;
+}
+function openNickEditor(){
+  state = 'nick';
+  if(nickInput) nickInput.value = getPlayerNick();
+  if(nickConfigEl) nickConfigEl.classList.add('show');
+  setTimeout(()=>{ try{ nickInput && nickInput.focus(); }catch(e){} }, 30);
+}
+function closeNickEditor(){
+  if(nickConfigEl) nickConfigEl.classList.remove('show');
+}
+async function saveAccountToSupabase(){
+  try{
+    // REST tabulky se použijí až po spuštění SQL souboru v Supabase.
+    // Bez toho by Supabase vracel 404 do konzole.
+    if(localStorage.getItem('echo_noir_db_ready') !== '1') return;
+    if(!ensureOnlineClient()) return;
+    const nick = getPlayerNick();
+    if(!nick) return;
+    await online.client.from('echo_noir_accounts').upsert({
+      id: online.clientId,
+      nickname: nick,
+      total_kills: player.totalKills|0,
+      total_xp: player.totalXp|0,
+      level: player.level|0,
+      updated_at: new Date().toISOString()
+    }, { onConflict:'id' });
+  }catch(e){}
 }
 
 function normalizeSupabaseUrl(value){
@@ -348,7 +408,7 @@ function setupOnlineRoomChannel(){
 function sendOnlineState(force=false){
   if(!online.active || !online.roomChannel || state!=='play') return;
   const now = performance.now();
-  if(!force && now - online.lastSend < 55) return;
+  if(!force && now - online.lastSend < 30) return;
   online.lastSend = now;
   const pkt = {
     id:online.clientId,
@@ -356,7 +416,7 @@ function sendOnlineState(force=false){
     host:online.isHost,
     x:player.x,y:player.y,ang:player.ang,
     walk:player.walk,moving:player.moving,
-    hp:player.hp,dead:player.dead,
+    hp:player.hp,maxHp:player.maxHp,dead:player.dead,
     gameMode,weaponType:player.weaponType,characterKey:player.characterKey,
     level:player.level,kills:player.kills,totalKills:player.totalKills,
     t:Date.now()
@@ -410,7 +470,10 @@ function drawOnlinePlayers(){
   for(const p of Object.values(online.remotePlayers)){
     if(!p || p.gameMode !== gameMode) continue;
     if(Date.now() - (p.lastSeen || 0) > 6000) continue;
-    drawSpriteAt(p.x,p.y,p.ang||0,p.walk||0,!!p.moving,p.name||'HRÁČ','brightness(.50) contrast(1.20) saturate(.85)');
+    if(!Number.isFinite(p.rx)){ p.rx = p.x; p.ry = p.y; }
+    p.rx += (p.x - p.rx) * .34;
+    p.ry += (p.y - p.ry) * .34;
+    drawSpriteAt(p.rx,p.ry,p.ang||0,p.walk||0,!!p.moving,p.name||'HRÁČ','brightness(.50) contrast(1.20) saturate(.85)',p.hp,p.maxHp||60);
   }
 }
 
@@ -463,37 +526,38 @@ const cameraCandidates = [
   {x:2230,y:900,ang:Math.PI+.05},{x:120,y:1465,ang:-.16},{x:1185,y:1465,ang:-1.58},{x:2230,y:1465,ang:Math.PI-.18}
 ];
 const missionName = 'MISE: ČERNÝ SKLAD';
+const missionId = 'cerny_sklad';
 const playerNick = 'LUKAMER';
 const loadoutDefs = {
   m4: {
     key: 'm4',
-    name: 'Základní postavička zbraň 1',
-    title: 'M4A1 / základ',
-    desc: 'Zbraň pro první základní postavu Zlatý Rachot.',
+    name: 'M4A1',
+    title: 'Útočná puška',
+    desc: 'Vyvážená automatická puška pro základní postavu.',
     imgPath: 'loadout_m4.png',
     sound: soundPaths.weapons.ak47
   },
   sniper: {
     key: 'sniper',
-    name: 'Základní postavička zbraň 2',
-    title: 'Sniper / základ',
-    desc: 'Sniper varianta pro první základní postavu.',
+    name: 'Sniper',
+    title: 'Odstřelovačka',
+    desc: 'Přesná puška na jednotlivé silné rány.',
     imgPath: 'loadout_sniper.png',
     sound: soundPaths.weapons.awp
   },
   lmg: {
     key: 'lmg',
-    name: 'Základní postavička zbraň 3',
-    title: 'Kulomet / základ',
-    desc: 'Kulometná varianta pro první základní postavu.',
+    name: 'Kulomet',
+    title: 'Těžký kulomet',
+    desc: 'Rychlá palba a velký zásobník.',
     imgPath: 'loadout_lmg.png',
     sound: soundPaths.weapons.smg
   },
   shotgun: {
     key: 'shotgun',
-    name: 'Základní postavička zbraň 4',
-    title: 'Shotgun / základ',
-    desc: 'Brokovnice pro první základní postavu.',
+    name: 'Shotgun',
+    title: 'Brokovnice',
+    desc: 'Silná zblízka, střílí rozptylem broků.',
     imgPath: 'loadout_shotgun.png',
     sound: soundPaths.weapons.shotgun
   }
@@ -542,22 +606,22 @@ characterOrder.forEach(key => {
 });
 const weaponDefs = {
   m4: {
-    name: 'Základní postavička zbraň 1', clip: 30, reserve: 120, damage: 66, speed: 980, spread: .028, fireDelay: .11,
+    name: 'M4A1', clip: 30, reserve: 120, damage: 66, speed: 980, spread: .028, fireDelay: .11,
     muzzleDist: 72, shellOffsetForward: 20, shellOffsetSide: -11, reloadTime: 1.35, pellets: 1,
     sound: soundPaths.weapons.ak47
   },
   sniper: {
-    name: 'Základní postavička zbraň 2', clip: 5, reserve: 25, damage: 160, speed: 1680, spread: .005, fireDelay: .95,
+    name: 'Sniper', clip: 5, reserve: 25, damage: 160, speed: 1680, spread: .005, fireDelay: .95,
     muzzleDist: 82, shellOffsetForward: 22, shellOffsetSide: -10, reloadTime: 1.9, pellets: 1,
     sound: soundPaths.weapons.awp
   },
   lmg: {
-    name: 'Základní postavička zbraň 3', clip: 65, reserve: 195, damage: 52, speed: 900, spread: .055, fireDelay: .09,
+    name: 'Kulomet', clip: 65, reserve: 195, damage: 52, speed: 900, spread: .055, fireDelay: .09,
     muzzleDist: 76, shellOffsetForward: 22, shellOffsetSide: -10, reloadTime: 2.1, pellets: 1,
     sound: soundPaths.weapons.smg
   },
   shotgun: {
-    name: 'Základní postavička zbraň 4', clip: 8, reserve: 40, damage: 34, speed: 860, spread: .07, fireDelay: .72,
+    name: 'Shotgun', clip: 8, reserve: 40, damage: 34, speed: 860, spread: .07, fireDelay: .72,
     muzzleDist: 74, shellOffsetForward: 18, shellOffsetSide: -9, reloadTime: 1.65, pellets: 6,
     sound: soundPaths.weapons.shotgun
   }
@@ -841,7 +905,7 @@ function updateLobby(dt){
   camera.y = clamp(player.y - H/2, 0, Math.max(0,map.h-H));
   if(messageTimer>0) messageTimer -= dt;
 }
-function drawSpriteAt(x,y,ang,walk,moving,name,filter='brightness(.75) contrast(1.1)'){
+function drawSpriteAt(x,y,ang,walk,moving,name,filter='brightness(.75) contrast(1.1)',hp=null,maxHp=60){
   ctx.save();
   ctx.translate(x,y);
   ctx.rotate(ang - Math.PI/2);
@@ -859,6 +923,12 @@ function drawSpriteAt(x,y,ang,walk,moving,name,filter='brightness(.75) contrast(
   ctx.save();
   ctx.font='13px Impact'; ctx.textAlign='center'; ctx.fillStyle='#fff'; ctx.strokeStyle='#000'; ctx.lineWidth=3;
   ctx.strokeText(name,x,y-55); ctx.fillText(name,x,y-55);
+  if(Number.isFinite(hp)){
+    const bw=58,bh=7,bx=x-bw/2,by=y-47;
+    ctx.fillStyle='#111'; ctx.fillRect(bx,by,bw,bh);
+    ctx.fillStyle='#d20b1c'; ctx.fillRect(bx,by,bw*clamp(hp/Math.max(1,maxHp||60),0,1),bh);
+    ctx.strokeStyle='#fff'; ctx.lineWidth=1; ctx.strokeRect(bx,by,bw,bh);
+  }
   ctx.restore();
 }
 function drawShopkeeper(){
@@ -1080,7 +1150,8 @@ function drawLobbyWindows(){
   } else if(lobbyUi==='missions'){
     ctx.strokeText('VÝBĚR MISE',W/2,215); ctx.fillText('VÝBĚR MISE',W/2,215);
     const canStart = !online.active || online.isHost;
-    drawButton(W/2-205,280,410,64,canStart ? missionName : 'ČEKÁM NA HOSTA',canStart);
+    const pct = (player.missionProgress && player.missionProgress[missionId]) ? player.missionProgress[missionId] : 0;
+    drawButton(W/2-205,280,410,64,canStart ? (missionName + '  ' + pct + '%') : 'ČEKÁM NA HOSTA',canStart);
     ctx.font='16px Arial Black'; ctx.fillStyle='#aaa';
     ctx.fillText(canStart ? 'Misi spouští zakladatel místnosti.' : 'Misi může spustit jen hráč, který vytvořil místnost.',W/2,378);
   } else if(lobbyUi==='loadout'){
@@ -1090,11 +1161,8 @@ function drawLobbyWindows(){
   }
   ctx.font='18px Impact'; ctx.fillStyle='#d8d8d8';
   if(lobbyUi==='loadout' || lobbyUi==='shop'){
-    ctx.fillText('LVL ' + player.level + '   XP ' + (player.level>=10 ? 'MAX' : (player.levelXp + '/' + player.nextLevelXp)) + '   KILLY CELKEM: ' + player.totalKills, W/2, 518);
     drawButton(W/2-90,545,180,48,'ZAVŘÍT',true);
   } else {
-    ctx.fillText('LVL ' + player.level + '   XP ' + (player.level>=10 ? 'MAX' : (player.levelXp + '/' + player.nextLevelXp)), W/2, 466);
-    ctx.fillText('KILLY CELKEM: ' + player.totalKills, W/2, 490);
     drawButton(W/2-90,430,180,48,'ZAVŘÍT',true);
   }
   ctx.restore();
@@ -1102,7 +1170,7 @@ function drawLobbyWindows(){
 const player = {
   x:180,y:590,r:20,ang:0,spd:235,hp:60,maxHp:60,
   ammo:30,clip:30,reserve:90,reload:0,shootCd:0,bt:100,maxBt:100,
-  score:0,kills:0,totalKills:0,totalXp:0,level:1,levelXp:0,nextLevelXp:20,
+  score:0,kills:0,totalKills:0,totalXp:0,level:1,levelXp:0,nextLevelXp:20,missionProgress:{cerny_sklad:0},
   dead:false,pickupText:'',muzzleFx:0,walk:0,moving:false,weaponType:'m4',characterKey:'zlaty',reloadMax:0,
   bleedTime:0,bleedNext:0,blood:[]
 };
@@ -1114,7 +1182,9 @@ function saveProgress(){
       totalKills: player.totalKills|0,
       totalXp: player.totalXp|0,
       weaponType: player.weaponType || 'm4',
-      characterKey: player.characterKey || 'zlaty'
+      characterKey: player.characterKey || 'zlaty',
+      missionProgress: player.missionProgress || {cerny_sklad:0},
+      nick: getPlayerNick()
     }));
   }catch(e){}
 }
@@ -1127,6 +1197,8 @@ function loadProgress(){
     if(Number.isFinite(data.totalXp)) player.totalXp = Math.max(0, data.totalXp|0);
     if(data.weaponType && weaponDefs[data.weaponType]) player.weaponType = data.weaponType;
     if(data.characterKey && characterDefs[data.characterKey]) player.characterKey = data.characterKey;
+    if(data.missionProgress && typeof data.missionProgress === 'object') player.missionProgress = {...player.missionProgress, ...data.missionProgress};
+    if(data.nick && !localStorage.getItem('echo_noir_player_nick')) localStorage.setItem('echo_noir_player_nick', data.nick);
   }catch(e){}
 }
 function getCurrentPlayerSpritePath(){
@@ -1208,6 +1280,7 @@ function grantXp(amount=1){
   }
 }
 loadProgress();
+online.playerName = getPlayerNick() || online.playerName || ('HRÁČ ' + online.clientId.slice(-4).toUpperCase());
 recalcPlayerLevel();
 applyLoadout(player.weaponType, false, true);
 if(player.characterKey === 'zlaty') updatePlayerSprite();
@@ -1223,6 +1296,7 @@ let bulletMarks = [];
 let bloodDecals = [];
 let securityAlarm = {x:0,y:0,timer:0,source:''};
 let wave = 1;
+let missionComplete = false;
 
 function resetGame(){
   gameMode = 'mission';
@@ -1235,7 +1309,7 @@ function resetGame(){
   player.shootCd=0; player.bt=100; player.score=0; player.kills=0; player.dead=false; player.muzzleFx=0; player.walk=0; player.moving=false; player.reloadMax=0; player.bleedTime=0; player.bleedNext=0; player.blood=[];
   enemies = []; turrets = []; cameras = []; bullets = []; particles = []; pickups = []; shells = []; bulletMarks = []; bloodDecals = [];
   securityAlarm = {x:0,y:0,timer:0,source:''};
-  wave = 1; message=''; messageTimer=0; shake=0;
+  wave = 1; missionComplete=false; message='CÍL: ELIMINUJ VŠECHNY NEPŘÁTELE'; messageTimer=3.2; shake=0;
   resetFog();
   spawnWave();
   spawnSecurity();
@@ -1509,6 +1583,7 @@ function enemySeesPlayer(e){
 }
 function pushParticle(x,y,vx,vy,life,size,kind='spark'){
   particles.push({x,y,vx,vy,life,max:life,size,kind});
+  if(particles.length > 260) particles.splice(0, particles.length - 260);
 }
 function splatter(x,y,n=8,power=1){
   // Bez explozivního rozprsknutí krve. Krev řeší decals/louže a sprayBloodToWall.
@@ -1528,7 +1603,7 @@ function addBloodDecal(x,y,size=10,onWall=false,a=0){
     drips:onWall ? 1+((Math.random()*3)|0) : ((Math.random()*3)|0),
     seed:Math.random()*1000
   });
-  if(bloodDecals.length > 420) bloodDecals.splice(0, bloodDecals.length - 420);
+  if(bloodDecals.length > 260) bloodDecals.splice(0, bloodDecals.length - 260);
 }
 function sprayBloodToWall(x,y,a,maxLen=90){
   const step = 6;
@@ -1622,6 +1697,15 @@ function shoot(owner, x,y,a, dmg, speed, spread=.035){
 }
 
 function update(dt){
+  if(state==='loading'){
+    loadingTimer -= dt;
+    if(loadingTimer <= 0){
+      if(!getPlayerNick()) openNickEditor();
+      else { online.playerName = getPlayerNick(); state='menu'; saveAccountToSupabase(); }
+    }
+    return;
+  }
+  if(state==='nick') return;
   onlineTick(dt);
   if(state==='menu' && menuStep==='searching'){
     searchTimer -= dt;
@@ -2076,11 +2160,16 @@ function update(dt){
   if(flashlightBlink > 0) flashlightBlink = Math.max(0, flashlightBlink - dt);
   else if(Math.random() < dt * .09) flashlightBlink = rand(.04,.12);
 
-  if(enemies.every(e=>e.hp<=0)){
-    wave++;
+  if(!missionComplete && enemies.length && enemies.every(e=>e.hp<=0)){
+    missionComplete = true;
+    player.missionProgress[missionId] = 100;
+    saveProgress();
+    saveAccountToSupabase();
+    message = 'VYHRÁL SI';
+    messageTimer = 999;
     player.reserve += 16;
     player.hp = Math.min(player.maxHp, player.hp + 18);
-    spawnWave();
+    stopMusic();
   }
 
   camera.x = clamp(player.x - W/2, 0, map.w-W);
@@ -2096,10 +2185,46 @@ function toWorld(){
   mouse.worldY = camera.y + (mouse.y - r.top) * sy;
 }
 
+function drawLoading(){
+  ctx.save();
+  ctx.fillStyle='#050505';
+  ctx.fillRect(0,0,W,H);
+  ctx.textAlign='center';
+  ctx.font='72px Impact';
+  ctx.strokeStyle='#000';
+  ctx.lineWidth=10;
+  ctx.fillStyle='#fff';
+  ctx.strokeText('ECHO NOIR',W/2,230);
+  ctx.fillText('ECHO NOIR',W/2,230);
+  const p = clamp(1 - loadingTimer/1.65, 0, 1);
+  ctx.fillStyle='rgba(255,255,255,.12)';
+  ctx.fillRect(W/2-220,340,440,24);
+  ctx.fillStyle='#d20b1c';
+  ctx.fillRect(W/2-220,340,440*p,24);
+  ctx.strokeStyle='#fff';
+  ctx.lineWidth=2;
+  ctx.strokeRect(W/2-220,340,440,24);
+  ctx.font='24px Impact';
+  ctx.fillStyle='#ddd';
+  ctx.fillText('LOADING...',W/2,395);
+  ctx.restore();
+}
+function drawNickWaiting(){
+  ctx.save();
+  ctx.fillStyle='#050505';
+  ctx.fillRect(0,0,W,H);
+  ctx.textAlign='center';
+  ctx.font='48px Impact';
+  ctx.fillStyle='#fff';
+  ctx.fillText('ZADEJ NICK',W/2,260);
+  ctx.restore();
+}
 function draw(){
   ctx.save();
   ctx.clearRect(0,0,W,H);
-  if(state==='menu') drawMenu();
+  if(state==='loading') drawLoading();
+  else if(state==='nick') drawNickWaiting();
+  else if(state==='menu') drawMenu();
   else {
     const sx = shake ? rand(-shake,shake) : 0;
     const sy = shake ? rand(-shake,shake) : 0;
@@ -2665,10 +2790,10 @@ function drawLighting(){
   const wx = player.x, wy = player.y;
   const a = player.ang;
   const blinkMul = flashlightBlink > 0 ? .12 : 1;
-  const flicker = (.96 + Math.sin(performance.now()/49)*.018 + Math.random()*.010) * blinkMul;
+  const flicker = (.96 + Math.sin(performance.now()/49)*.018 + Math.sin(performance.now()/97)*.010) * blinkMul;
   const len = (keys[' '] ? 770 : 690) * flicker;
   const width = keys[' '] ? .50 : .44;
-  const rayCount = 58;
+  const rayCount = 42;
 
   ctx.fillStyle='rgba(0,0,0,.76)';
   ctx.fillRect(0,0,W,H);
@@ -2708,13 +2833,42 @@ function drawLighting(){
   ctx.fillStyle=beam;
   ctx.beginPath(); ctx.moveTo(px,py); for(const pt of pts) ctx.lineTo(pt.x,pt.y); ctx.closePath(); ctx.fill();
 
+  // teammate flashlights - stejně viditelná baterka jako u hráče
+  if(online.active){
+    for(const op of Object.values(online.remotePlayers)){
+      if(!op || op.gameMode !== gameMode || Date.now() - (op.lastSeen||0) > 6000) continue;
+      const ox = Number.isFinite(op.rx) ? op.rx : op.x;
+      const oy = Number.isFinite(op.ry) ? op.ry : op.y;
+      const oa = op.ang || 0;
+      const sx = ox - camera.x, sy = oy - camera.y;
+      const oLen = 690, oWidth = .44, rc = 26;
+      const oPts = [];
+      for(let i=0;i<=rc;i++){
+        const ra = oa-oWidth+(i/rc)*oWidth*2;
+        const d = castLightDistance(ox,oy,ra,oLen);
+        oPts.push({x:sx+Math.cos(ra)*d,y:sy+Math.sin(ra)*d});
+      }
+      const oaura = ctx.createRadialGradient(sx,sy,4,sx,sy,32);
+      oaura.addColorStop(0,'rgba(255,255,255,.70)');
+      oaura.addColorStop(1,'rgba(255,255,255,0)');
+      ctx.fillStyle=oaura; ctx.beginPath(); ctx.arc(sx,sy,42,0,Math.PI*2); ctx.fill();
+      const og=ctx.createRadialGradient(sx,sy,14,sx,sy,oLen);
+      og.addColorStop(0,'rgba(255,255,255,.84)');
+      og.addColorStop(.22,'rgba(255,255,255,.58)');
+      og.addColorStop(.62,'rgba(255,255,255,.24)');
+      og.addColorStop(1,'rgba(255,255,255,0)');
+      ctx.fillStyle=og;
+      ctx.beginPath(); ctx.moveTo(sx,sy); for(const pt of oPts) ctx.lineTo(pt.x,pt.y); ctx.closePath(); ctx.fill();
+    }
+  }
+
   // enemy flashlights - stejné silné jako hráč
   for(const e of enemies){
     if(e.hp <= 0) continue;
     const ex=e.x-camera.x, ey=e.y-camera.y;
     const eLen = 690;
     const eWidth = .44;
-    const ePts=[]; const rc=34;
+    const ePts=[]; const rc=20;
     for(let i=0;i<=rc;i++){
       const ra=e.ang-eWidth+(i/rc)*eWidth*2;
       const d=castLightDistance(e.x,e.y,ra,eLen);
@@ -2734,7 +2888,7 @@ function drawLighting(){
     if(c.hp <= 0) continue;
     const cx=c.x-camera.x, cy=c.y-camera.y;
     const cLen = 720, cWidth = .38;
-    const cPts=[]; const rc=26;
+    const cPts=[]; const rc=16;
     for(let i=0;i<=rc;i++){
       const ra=c.ang-cWidth+(i/rc)*cWidth*2;
       const d=castLightDistance(c.x,c.y,ra,cLen);
@@ -2753,7 +2907,7 @@ function drawLighting(){
     if(t.hp <= 0) continue;
     const tx=t.x-camera.x, ty=t.y-camera.y;
     const tLen = 690, tWidth = .44;
-    const tPts=[]; const rc=30;
+    const tPts=[]; const rc=16;
     for(let i=0;i<=rc;i++){
       const ra=t.ang-tWidth+(i/rc)*tWidth*2;
       const d=castLightDistance(t.x,t.y,ra,tLen);
@@ -2840,19 +2994,6 @@ function drawHUD(){
   ctx.fillText(ammoRes, 120, 48);
   ctx.font='12px Arial'; ctx.fillStyle='rgba(255,255,255,.6)';
   ctx.fillText('AMMO', 88, 66);
-  if(gameMode==='lobby' && online.active){
-    ctx.font='17px Impact'; ctx.fillStyle='rgba(255,255,255,.82)';
-    ctx.fillText('ONLINE ' + (online.isHost ? 'HOST ' : 'PLAYER ') + (online.roomCode || ''), 18, 104);
-    ctx.fillText('HRÁČI: ' + (1 + Object.keys(online.remotePlayers).length) + '/2', 18, 128);
-  }
-  if(gameMode!=='lobby'){
-    ctx.font='17px Impact'; ctx.fillStyle='rgba(255,255,255,.86)'; ctx.fillText(missionName, 18, 104);
-    ctx.font='18px Impact';
-    ctx.fillStyle='#fff';
-    ctx.fillText('KILLY: ' + player.kills, 18, 128);
-    ctx.fillText('LVL ' + player.level + '  XP ' + (player.level>=10 ? 'MAX' : (player.levelXp + '/' + player.nextLevelXp)), 18, 152);
-  }
-
   // main menu ponechat
   ctx.fillStyle='rgba(0,0,0,.9)'; ctx.strokeStyle='#d20b1c'; ctx.lineWidth=4;
   ctx.fillRect(1090,8,150,42); ctx.strokeRect(1090,8,150,42);
@@ -3071,6 +3212,18 @@ window.addEventListener('beforeunload', ()=>{
 if(sbSaveBtn) sbSaveBtn.addEventListener('click', saveSupabaseEditor);
 if(sbCloseBtn) sbCloseBtn.addEventListener('click', closeSupabaseEditor);
 if(sbConfigEl) sbConfigEl.addEventListener('click', e=>{ if(e.target===sbConfigEl) closeSupabaseEditor(); });
+if(nickSaveBtn) nickSaveBtn.addEventListener('click', ()=>{
+  setPlayerNick(nickInput ? nickInput.value : '');
+  closeNickEditor();
+  state='menu';
+});
+if(nickInput) nickInput.addEventListener('keydown', e=>{
+  if(e.key==='Enter'){
+    setPlayerNick(nickInput.value);
+    closeNickEditor();
+    state='menu';
+  }
+});
 
 // předvyplní dodaný Supabase config do localStorage při prvním spuštění
 if(!localStorage.getItem('echo_noir_supabase_url')) localStorage.setItem('echo_noir_supabase_url', SUPABASE_DEFAULT_URL);
