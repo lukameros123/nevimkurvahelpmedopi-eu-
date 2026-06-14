@@ -1,6 +1,7 @@
 <!doctype html>
 <html lang="cs">
 <head>
+<link rel="icon" href="data:,">
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
 <title>Projekt SAS</title>
@@ -83,9 +84,113 @@ ctx.imageSmoothingEnabled = true;
 try { ctx.imageSmoothingQuality = 'high'; } catch(e) {}
 const W = canvas.width, H = canvas.height;
 
+const CMD_LOG_KEY = 'lukengine_cmd_logs_v1';
+let cmdSeq = +(localStorage.getItem('lukengine_cmd_seq') || 0);
+let cmdChannel = null;
+try{ cmdChannel = new BroadcastChannel('lukengine_cmd'); }catch(e){}
+function cmdLog(type, msg, data=null){
+  try{
+    const entry = {id:++cmdSeq, t:new Date().toLocaleTimeString(), type:String(type||'INFO'), msg:String(msg||''), data:data||null};
+    localStorage.setItem('lukengine_cmd_seq', String(cmdSeq));
+    const list = JSON.parse(localStorage.getItem(CMD_LOG_KEY) || '[]');
+    list.push(entry);
+    while(list.length > 260) list.shift();
+    while(list.length > 90) list.shift();
+    localStorage.setItem(CMD_LOG_KEY, JSON.stringify(list));
+    if(cmdChannel) cmdChannel.postMessage(entry);
+  }catch(e){ cmdLog('ERR','saveAccountToSupabase',e && (e.message||String(e))); }
+}
+window.addEventListener('error', e=>cmdLog('ERROR', e.message || 'window error', {file:e.filename,line:e.lineno,col:e.colno}));
+window.addEventListener('unhandledrejection', e=>cmdLog('PROMISE', (e.reason && (e.reason.message || e.reason.toString())) || 'unhandled rejection'));
+cmdLog('BOOT','LukEngine start');
+
+const preload = {active:true, mode:'game', label:'START', total:1, loaded:0, progress:0, done:false, error:0, started:false, complete:null};
+let cmdStateTimer = 0;
+let fogShareTimer = 0;
+let pathSearchBudget = 3;
+function setPreload(mode,label,total,complete){
+  preload.active=true; preload.mode=mode; preload.label=label||mode; preload.total=Math.max(1,total||1); preload.loaded=0; preload.progress=0; preload.done=false; preload.error=0; preload.started=true; preload.complete=complete||null;
+  cmdLog('PRELOAD','start '+preload.label,{total:preload.total});
+}
+function preloadOne(src, kind, done){
+  let finished=false;
+  function finish(ok){
+    if(finished) return;
+    finished=true;
+    if(!ok) preload.error++;
+    preload.loaded++;
+    preload.progress = clamp(preload.loaded / Math.max(1,preload.total),0,1);
+    if(!ok) cmdLog('LOAD_ERR', src);
+    done && done();
+  }
+  try{
+    if(kind==='img'){
+      const im = new Image();
+      im.decoding = 'async';
+      im.loading = 'eager';
+      im.onload = ()=>{
+        if(im.decode) im.decode().then(()=>finish(true)).catch(()=>finish(true));
+        else finish(true);
+      };
+      im.onerror = ()=>finish(false);
+      im.src = src;
+    } else {
+      // audio se nenačítá do loadingu, jen se založí cache a jede lazy po prvním použití
+      getAudio(src);
+      finish(true);
+    }
+  }catch(e){ finish(false); }
+}
+function startPreload(mode='game', complete=null){
+  const imgs = [
+    'player_custom.png','char_zlaty_rachot.png','char_kloboucnik.png','char_sekac.png',
+    'enemy_custom.png','enemy_variant1.png','enemy_variant2.png','enemy_variant3.png','enemy_variant4.png',
+    'turret_custom.png','loadout_m4.png','loadout_sniper.png','loadout_lmg.png','loadout_shotgun.png',
+    'gear_laser.png','gear_stock.png','gear_bipod.png'
+  ];
+  const aud = [
+    soundPaths.music,
+    soundPaths.weapons.ak47, soundPaths.weapons.m4, soundPaths.weapons.pistol, soundPaths.weapons.awp,
+    soundPaths.weapons.sniper, soundPaths.weapons.shotgun, soundPaths.weapons.smg, soundPaths.weapons.lmg,
+    soundPaths.reload, soundPaths.pickup, soundPaths.hit, soundPaths.death, soundPaths.door, soundPaths.grenade, soundPaths.explosion
+  ].filter(Boolean);
+  const unique = [];
+  for(const src of imgs){
+    if(src && !unique.includes(src)) unique.push(src);
+  }
+  // zvuky jen předpřipravit, ale neblokovat loading
+  for(const src of aud){ if(src) setTimeout(()=>getAudio(src), 0); }
+  const label = mode === 'mission' ? 'PŘEDNAČÍTÁM MISI' : 'PŘEDNAČÍTÁM CELOU HRU';
+  setPreload(mode,label,unique.length,complete);
+  if(!unique.length){ finishPreload(); return; }
+  let left = unique.length;
+  function oneDone(){ left--; if(left<=0) finishPreload(); }
+  for(const src of unique) preloadOne(src, 'img', oneDone);
+}
+function finishPreload(){
+  preload.progress=1; preload.done=true; preload.active=false;
+  cmdLog('PRELOAD','done '+preload.label,{errors:preload.error});
+  const cb = preload.complete; preload.complete=null;
+  if(cb) setTimeout(cb,40);
+}
+function updateCmdState(){
+  try{
+    const stateObj = {
+      state, gameMode, menuStep, online:{active:online.active,isHost:online.isHost,roomCode:online.roomCode,status:online.lastStatus,players:Object.keys(online.remotePlayers||{}).length},
+      player:{x:Math.round(player.x),y:Math.round(player.y),hp:Math.round(player.hp),weapon:player.weaponType,kills:player.kills,totalKills:player.totalKills,level:player.level},
+      counts:{enemies:enemies.length,bullets:bullets.length,shells:shells.length,particles:particles.length,craters:craters.length},
+      preload:{mode:preload.mode,progress:Math.round(preload.progress*100),active:preload.active,label:preload.label}
+    };
+    localStorage.setItem('lukengine_status', JSON.stringify(stateObj));
+    if(cmdChannel) cmdChannel.postMessage({status:stateObj});
+  }catch(e){}
+}
+
 const keys = Object.create(null);
 const mouse = {x: W/2, y: H/2, down:false, worldX:0, worldY:0};
 let last = performance.now();
+let perfMode = 0;
+let slowFrameScore = 0;
 let state = 'loading';
 let loadingTimer = 1.65;
 let menuStep = 'main';
@@ -93,10 +198,17 @@ let searchTimer = 0;
 let roomCreated = false;
 let gameMode = 'mission'; // mission / lobby
 let lobbyUi = null;       // shop / missions
+let arenaConfirmStep = 0;
+let arenaCountdown = 0;
+let arenaWaveDelay = 0;
+let arenaRewarded = false;
+let arenaLastReward = 0;
 let lobbyELock = false;
 let flashlightBlink = 0;
 let flashlightOn = true;
-let noise = {x:0,y:0,timer:0};
+let noise = {x:0,y:0,timer:0,type:'shot'};
+let footNoiseTimer = 0;
+let stepSoundTimer = 0;
 let camera = {x:0,y:0};
 let shake = 0;
 let shakeTimer = 0;
@@ -106,6 +218,15 @@ const story = {active:false, step:0, timer:0, focus:'player', locked:false};
 let chatBubble = {text:'', timer:0};
 let merchantBubble = {text:'', timer:0, next:3.5};
 let merchantQuestion = {active:false, text:'', timer:0, asked:false};
+let gamblerBubble = {text:'Máš štěstí? Pojď to zkusit!', timer:999};
+let storyNpcBubble = {text:'', timer:0};
+const caseOpening = {active:false,timer:0,duration:4.2,items:[],win:null,granted:false};
+const companion = {active:false,x:0,y:0,ang:0,hp:100,maxHp:100,shootCd:0,walk:0,moving:false};
+const pet = {active:false,x:0,y:0,ang:0,walk:0,moving:false,attackCd:0};
+let friendlyBots = [];
+let chaosTurrets = [];
+let chaosCountdown = 0;
+let chaosSpawned = false;
 const lobbyTargets = [];
 let missionELock = false;
 const alarmButtons = [];
@@ -139,7 +260,10 @@ const online = {
   lastSend:0,
   lastIndexTrack:0,
   lastStatus:'OFFLINE',
-  missionSeed:0
+  missionSeed:0,
+  hostLastSeen:0,
+  closeSent:false,
+  restBroken:false
 };
 if(!localStorage.getItem('echo_noir_account_id')) localStorage.setItem('echo_noir_account_id', online.clientId);
 if(!localStorage.getItem('echo_noir_db_ready')) localStorage.setItem('echo_noir_db_ready','0');
@@ -149,9 +273,10 @@ const clamp = (v,a,b)=>Math.max(a,Math.min(b,v));
 const dist = (a,b,c,d)=>Math.hypot(a-c,b-d);
 const angleTo = (a,b,c,d)=>Math.atan2(d-b,c-a);
 
-// Zvuky: stačí do stejné složky jako index.html přidat soubory:
+// Zvuky jsou vypnuté přes prázdné cesty, aby lokální ZIP neházal 404 na chybějící mp3.
 const soundPaths = {
   music: 'hra.mp3',
+  step: 'chuze.mp3',
   weapons: {
     ak47: 'ak47.mp3',
     m4: 'ak47.mp3',
@@ -177,6 +302,7 @@ let soundEnabled = true;
 function initAudio(){
   audioReady = true;
   playMusic();
+  cmdLog('AUDIO','init');
 }
 
 function getAudio(path){
@@ -201,7 +327,7 @@ function playSound(path, volume=.55){
 }
 
 function playMusic(){
-  if(!soundEnabled) return;
+  if(!soundEnabled || !soundPaths.music) return;
   try{
     if(!musicAudio){
       musicAudio = new Audio(soundPaths.music);
@@ -238,8 +364,13 @@ function openNickEditor(){
 function closeNickEditor(){
   if(nickConfigEl) nickConfigEl.classList.remove('show');
 }
+
+function dbRestEnabled(){
+  return localStorage.getItem('echo_noir_db_ready') === '1' && !online.restBroken;
+}
 async function saveAccountToSupabase(){
   try{
+    if(!dbRestEnabled()) return;
     if(!ensureOnlineClient()) return;
     const nick = getPlayerNick();
     if(!nick) return;
@@ -266,11 +397,28 @@ function getLocalLeaderboard(){
   rows.sort((a,b)=>(b.level||0)-(a.level||0) || (b.total_kills||0)-(a.total_kills||0));
   return rows;
 }
+
+async function saveArenaScoreToSupabase(){
+  try{
+    if(!dbRestEnabled()) return;
+    if(!ensureOnlineClient()) return;
+    const nick = getPlayerNick() || online.playerName || 'HRÁČ';
+    await online.client.from('echo_noir_arena_scores').insert({
+      player_id: online.clientId,
+      nickname: nick,
+      kills: player.kills|0,
+      wave: wave|0,
+      level: player.level|0
+    });
+  }catch(e){}
+}
+
 async function refreshLeaderboard(force=false){
   try{
     if(!force && leaderboardTimer > 0) return;
     leaderboardTimer = 8;
     leaderboard = getLocalLeaderboard();
+    if(!dbRestEnabled()) return;
     if(!ensureOnlineClient()) return;
     const {data,error} = await online.client
       .from('echo_noir_accounts')
@@ -351,6 +499,7 @@ function saveSupabaseEditor(){
   saveOnlineConfig(sbUrlInput ? sbUrlInput.value : '', sbKeyInput ? sbKeyInput.value : '');
   online.client = null;
   online.ready = false;
+  online.restBroken = false;
   ensureOnlineClient();
   closeSupabaseEditor();
   message = 'SUPABASE ULOŽENO';
@@ -371,7 +520,7 @@ function ensureOnlineClient(){
   }
   if(!online.client){
     online.client = window.supabase.createClient(cfg.url, cfg.key, {
-      realtime: { params: { eventsPerSecond: 30 } }
+      realtime: { params: { eventsPerSecond: 80 } }
     });
   }
   online.ready = true;
@@ -408,7 +557,7 @@ function subscribeOnlineIndex(trackSelf=false){
   if(!ensureOnlineClient()) return false;
   if(online.indexChannel){
     if(trackSelf && online.isHost) trackOnlineRoom();
-    else if(online.searching){ try{ online.indexChannel.track({type:'searcher',id:online.clientId,name:online.playerName,ts:Date.now()}); }catch(e){} }
+    else if(online.searching){ try{ online.indexChannel.track({type:'searcher',id:online.clientId,name:online.playerName,ts:Date.now()}); requestRoomList(); }catch(e){} }
     return true;
   }
   online.indexChannel = online.client.channel(ONLINE_INDEX_CHANNEL, {
@@ -418,12 +567,18 @@ function subscribeOnlineIndex(trackSelf=false){
     .on('broadcast',{event:'roomAnnounce'},payload=>{
       rememberOnlineRoom(payload.payload || {});
     })
+    .on('broadcast',{event:'roomRequest'},payload=>{
+      if(online.isHost && online.active && online.roomId) trackOnlineRoom();
+    })
     .on('presence',{event:'sync'},()=>syncOnlineRooms())
     .subscribe(async status=>{
-      online.lastStatus = status;
+      online.lastStatus = status; cmdLog('ONLINE','index '+status);
       if(status === 'SUBSCRIBED'){
         if(trackSelf && online.isHost) trackOnlineRoom();
-        else await online.indexChannel.track({type:'searcher',id:online.clientId,name:online.playerName,ts:Date.now()});
+        else {
+          await online.indexChannel.track({type:'searcher',id:online.clientId,name:online.playerName,ts:Date.now()});
+          requestRoomList();
+        }
         syncOnlineRooms();
       }
     });
@@ -438,18 +593,20 @@ async function trackOnlineRoom(){
     code:online.roomCode,
     host:online.playerName || getPlayerNick() || 'HOST',
     players,
+    mission:selectedMissionKey,
     started:gameMode==='mission',
     ts:Date.now()
   };
   rememberOnlineRoom(room);
   try{ await online.indexChannel.track(room); }catch(e){}
-  try{ await online.indexChannel.send({type:'broadcast',event:'roomAnnounce',payload:room}); }catch(e){}
+  // roomAnnounce broadcast vypnutý: presence track stačí a nevyvolává REST fallback warning.
   upsertDbRoom(room);
 }
 
 
 async function upsertDbRoom(room){
   try{
+    if(!dbRestEnabled()) return;
     if(!online.client || !room || !room.roomId) return;
     await online.client.from('echo_noir_rooms').upsert({
       room_id:room.roomId, code:room.code, host_id:online.clientId,
@@ -460,20 +617,25 @@ async function upsertDbRoom(room){
 }
 async function fetchDbRooms(){
   try{
+    if(!dbRestEnabled()) return;
     if(!online.client) return;
     const since = new Date(Date.now()-18000).toISOString();
     const {data,error} = await online.client
       .from('echo_noir_rooms')
-      .select('room_id,code,host_name,players,started,updated_at')
+      .select('room_id,code,host_name,players,started,mission,updated_at')
       .eq('started',false)
       .gt('updated_at',since)
       .order('updated_at',{ascending:false})
       .limit(10);
-    if(error || !Array.isArray(data)) return;
+    if(error || !Array.isArray(data)){ online.restBroken = true; cmdLog('DB','rooms REST disabled', error || 'no data'); return; }
     for(const r of data){
-      rememberOnlineRoom({type:'room',roomId:r.room_id,code:r.code,host:r.host_name,players:r.players,started:r.started,ts:new Date(r.updated_at).getTime()});
+      rememberOnlineRoom({type:'room',roomId:r.room_id,code:r.code,host:r.host_name,players:r.players,started:r.started,mission:r.mission,ts:new Date(r.updated_at).getTime()});
     }
-  }catch(e){}
+  }catch(e){ online.restBroken = true; }
+}
+function requestRoomList(){
+  // Presence sync stačí pro seznam místností. Broadcast request je vypnutý kvůli REST fallback warningu.
+  return;
 }
 function createOnlineRoom(){
   if(!ensureOnlineClient()) return false;
@@ -483,13 +645,18 @@ function createOnlineRoom(){
   online.roomId = 'r_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2,6);
   online.roomCode = online.roomId.slice(-4).toUpperCase();
   online.remotePlayers = {};
+  online.hostLastSeen = Date.now();
+  online.closeSent = false;
   setupOnlineRoomChannel();
   online.lastIndexTrack = 0;
   subscribeOnlineIndex(true);
-  setTimeout(()=>trackOnlineRoom(),180);
-  setTimeout(()=>trackOnlineRoom(),850);
+  setTimeout(()=>trackOnlineRoom(),120);
+  setTimeout(()=>trackOnlineRoom(),450);
+  setTimeout(()=>trackOnlineRoom(),900);
+  setTimeout(()=>trackOnlineRoom(),1600);
+  setTimeout(()=>trackOnlineRoom(),2600);
   enterLobby();
-  message = 'ONLINE LOBBY ' + online.roomCode;
+  message = 'LOBBY VYTVOŘENO';
   messageTimer = 2;
   return true;
 }
@@ -504,8 +671,10 @@ function openOnlineSearch(){
   online.rooms = [];
   online.lastIndexTrack = 0;
   subscribeOnlineIndex(false);
-  setTimeout(()=>syncOnlineRooms(),250);
-  setTimeout(()=>fetchDbRooms(),450);
+  setTimeout(()=>{ syncOnlineRooms(); requestRoomList(); fetchDbRooms(); },150);
+  setTimeout(()=>{ requestRoomList(); fetchDbRooms(); },700);
+  setTimeout(()=>{ requestRoomList(); fetchDbRooms(); },1600);
+  setTimeout(()=>{ requestRoomList(); },2800);
   menuStep = 'online_search';
   return true;
 }
@@ -517,6 +686,8 @@ function joinOnlineRoom(room){
   online.roomId = room.roomId;
   online.roomCode = room.code || room.roomId.slice(-4).toUpperCase();
   online.remotePlayers = {};
+  online.hostLastSeen = Date.now();
+  online.closeSent = false;
   setupOnlineRoomChannel();
   enterLobby();
   message = 'PŘIPOJENO ' + online.roomCode;
@@ -538,7 +709,25 @@ function setupOnlineRoomChannel(){
     .on('broadcast',{event:'state'},payload=>{
       const p = payload.payload || {};
       if(!p.id || p.id === online.clientId) return;
+      if(p.host) online.hostLastSeen = Date.now();
       online.remotePlayers[p.id] = {...(online.remotePlayers[p.id]||{}), ...p, lastSeen:Date.now()};
+      if(p.host && p.mission && p.mission !== selectedMissionKey && state==='play' && gameMode==='mission'){
+        setSelectedMission(p.mission,true);
+        resetGame();
+      }
+      if(p.host && p.mission==='arena' && selectedMissionKey==='arena' && state==='play' && gameMode==='mission'){
+        if(Number.isFinite(p.wave) && p.wave > wave) wave = p.wave|0;
+        if(Number.isFinite(p.arenaCountdown)) arenaCountdown = Math.max(0, p.arenaCountdown|0);
+      }
+      if(p.host && p.mission==='vytah' && selectedMissionKey==='vytah' && Number.isFinite(p.elevatorFloor) && p.elevatorFloor !== missionElevator.floor && state==='play' && gameMode==='mission'){
+        missionElevator.floor = p.elevatorFloor|0;
+        missionElevator.active = false;
+        missionElevator.door = 0;
+        buildMap();
+        const esp = missionElevator.floor ? {x:1096,y:380} : missionStartPoint();
+        player.x=esp.x; player.y=esp.y; player.safeX=player.x; player.safeY=player.y;
+        resetFog(); revealFog(player.x,player.y,260);
+      }
     })
     .on('broadcast',{event:'startMission'},payload=>{
       const data = payload.payload || {};
@@ -558,18 +747,63 @@ function setupOnlineRoomChannel(){
       if(!s.id || s.id === online.clientId) return;
       spawnRemoteShot(s);
     })
+    .on('broadcast',{event:'step'},payload=>{
+      const s = payload.payload || {};
+      if(!s.id || s.id === online.clientId) return;
+      const rp = online.remotePlayers[s.id] || {id:s.id,name:s.name||'HRÁČ'};
+      if(Number.isFinite(s.x)) rp.x = s.x;
+      if(Number.isFinite(s.y)) rp.y = s.y;
+      rp.lastSeen = Date.now();
+      online.remotePlayers[s.id] = rp;
+      playSound(soundPaths.step,.20);
+    })
+    .on('broadcast',{event:'hostClose'},payload=>{
+      const d = payload.payload || {};
+      if(!online.isHost && (!d.roomId || d.roomId === online.roomId)) forceOnlineClosed('HOST ODEŠEL');
+    })
     .subscribe(async status=>{
-      online.lastStatus = status;
+      online.lastStatus = status; cmdLog('ONLINE','room '+status);
       if(status === 'SUBSCRIBED'){
         await online.roomChannel.track({id:online.clientId,name:online.playerName,role:online.isHost?'host':'player',ts:Date.now()});
         sendOnlineState(true);
       }
     });
 }
+function deleteDbRoom(){
+  try{
+    if(!dbRestEnabled()) return;
+    if(online.client && online.roomId) online.client.from('echo_noir_rooms').delete().eq('room_id',online.roomId).then(()=>{}).catch(()=>{ online.restBroken=true; });
+  }catch(e){}
+}
+function closeOnlineRoom(reason='HOST ODEŠEL'){
+  if(!online.active) return;
+  if(online.isHost && online.roomChannel && !online.closeSent){
+    online.closeSent = true;
+    try{ online.roomChannel.send({type:'broadcast',event:'hostClose',payload:{roomId:online.roomId,reason,t:Date.now()}}); }catch(e){}
+    deleteDbRoom();
+  }
+  try{ if(online.client && online.roomChannel) online.client.removeChannel(online.roomChannel); }catch(e){}
+  online.roomChannel = null;
+  online.active = false;
+  online.searching = false;
+  online.isHost = false;
+  online.roomId = null;
+  online.roomCode = null;
+  online.remotePlayers = {};
+}
+function forceOnlineClosed(reason='HOST ODEŠEL'){
+  closeOnlineRoom(reason);
+  lobbyUi = null;
+  gameMode = 'lobby';
+  state = 'menu';
+  menuStep = 'main';
+  message = reason;
+  messageTimer = 2.2;
+}
 function sendOnlineState(force=false){
   if(!online.active || !online.roomChannel || state!=='play') return;
   const now = performance.now();
-  if(!force && now - online.lastSend < 30) return;
+  if(!force && now - online.lastSend < 55) return;
   online.lastSend = now;
   const pkt = {
     id:online.clientId,
@@ -579,28 +813,59 @@ function sendOnlineState(force=false){
     walk:player.walk,moving:player.moving,
     hp:player.hp,maxHp:player.maxHp,dead:player.dead,
     chatText:chatBubble.timer>0?chatBubble.text:'',chatUntil:chatBubble.timer>0?Date.now()+Math.max(400,chatBubble.timer*1000):0,
-    gameMode,weaponType:player.weaponType,characterKey:player.characterKey,
+    gameMode,mission:selectedMissionKey,elevatorFloor:missionElevator.floor,weaponType:player.weaponType,characterKey:player.characterKey,selectedSlot:player.selectedSlot,
     level:player.level,kills:player.kills,totalKills:player.totalKills,
+    wave:wave|0,arenaCountdown:Math.ceil(arenaCountdown||0),
+    hp:player.hp,maxHp:player.maxHp,
+    ammo:player.ammo|0,clip:player.clip|0,reserve:player.reserve|0,reload:player.reload||0,
+    skills:{...(player.skills||{})},
+    armorProtection:player.armorProtection||0,
+    skillHpBonus:player.skillHpBonus||0,
+    skillSpeedBonus:player.skillSpeedBonus||0,
+    skillStrBonus:player.skillStrBonus||0,
+    skillDefBonus:player.skillDefBonus||0,
+    gearHpBonus:player.gearHpBonus||0,
+    gearStrBonus:player.gearStrBonus||0,
+    equippedGear:{...(player.equippedGear||{})},
     t:Date.now()
   };
   try{ online.roomChannel.send({type:'broadcast',event:'state',payload:pkt}); }catch(e){}
 }
+
+function roomHasHostPresence(){
+  try{
+    if(!online.roomChannel) return true;
+    const st = online.roomChannel.presenceState();
+    for(const arr of Object.values(st)){
+      for(const p of arr){
+        if(p && p.role === 'host') return true;
+      }
+    }
+  }catch(e){}
+  return false;
+}
 function onlineTick(dt){
   if(online.isHost && online.indexChannel && online.roomId){
-    if(performance.now() - online.lastIndexTrack > 750){
+    if(performance.now() - online.lastIndexTrack > 1600){
       online.lastIndexTrack = performance.now();
       trackOnlineRoom();
     }
   } else if(online.searching && online.indexChannel){
-    if(performance.now() - online.lastIndexTrack > 1200){
+    if(performance.now() - online.lastIndexTrack > 700){
       online.lastIndexTrack = performance.now();
       syncOnlineRooms();
+      requestRoomList();
       fetchDbRooms();
     }
   }
   if(online.active) sendOnlineState(false);
   for(const [id,p] of Object.entries(online.remotePlayers)){
     if(Date.now() - (p.lastSeen || 0) > 6000) delete online.remotePlayers[id];
+  }
+  if(online.active && !online.isHost && online.hostLastSeen && Date.now() - online.hostLastSeen > 8500){
+    forceOnlineClosed('HOST ODEŠEL');
+  } else if(online.active && !online.isHost && online.roomChannel && Date.now() - online.hostLastSeen > 2500 && !roomHasHostPresence()){
+    forceOnlineClosed('HOST ODEŠEL');
   }
 }
 function startOnlineMission(){
@@ -611,7 +876,7 @@ function startOnlineMission(){
     return true;
   }
   const seed = Date.now();
-  const data = {seed,roomId:online.roomId,startedBy:online.clientId};
+  const data = {seed,roomId:online.roomId,startedBy:online.clientId,mission:selectedMissionKey};
   try{ online.roomChannel.send({type:'broadcast',event:'startMission',payload:data}); }catch(e){}
   applyOnlineMissionStart(data);
   trackOnlineRoom();
@@ -619,31 +884,54 @@ function startOnlineMission(){
 }
 function applyOnlineMissionStart(data={}){
   online.missionSeed = data.seed || Date.now();
+  if(data.mission) setSelectedMission(data.mission,true);
   lobbyUi = null;
-  gameMode = 'mission';
-  resetGame();
-  state = 'play';
-  if(online.active){
-    if(online.isHost){ player.x = 180; player.y = 590; }
-    else { player.x = 245; player.y = 590; }
-    player.ang = 0;
-    revealFog(player.x, player.y, 255);
-    camera.x = clamp(player.x - W/2, 0, Math.max(0,map.w-W));
-    camera.y = clamp(player.y - H/2, 0, Math.max(0,map.h-H));
-    sendOnlineState(true);
-  }
+  startMissionLoading(()=>{
+    gameMode = 'mission';
+    resetGame();
+    state = 'play';
+    if(online.active){
+      const osp = online.isHost ? missionStartPoint() : missionClientStartPoint();
+      player.x = osp.x; player.y = osp.y; player.safeX=player.x; player.safeY=player.y;
+      player.ang = 0;
+      revealFog(player.x, player.y, 360);
+      camera.x = clamp(player.x - W/2, 0, Math.max(0,map.w-W));
+      camera.y = clamp(player.y - H/2, 0, Math.max(0,map.h-H));
+      sendOnlineState(true);
+    }
+  });
 }
 function drawOnlinePlayers(){
   if(!online.active) return;
   for(const p of Object.values(online.remotePlayers)){
-    if(!p || p.gameMode !== gameMode) continue;
-    if(Date.now() - (p.lastSeen || 0) > 6000) continue;
+    if(!p) continue;
+    if(p.gameMode && p.gameMode !== gameMode && !(gameMode==='lobby' && p.gameMode==='mission') && !(gameMode==='mission' && p.gameMode==='lobby')) continue;
+    if(gameMode==='mission' && p.gameMode==='mission' && p.mission && p.mission !== selectedMissionKey) continue;
+    if(Date.now() - (p.lastSeen || 0) > 9000) continue;
+    if(!Number.isFinite(p.x) || !Number.isFinite(p.y)) continue;
     if(!Number.isFinite(p.rx)){ p.rx = p.x; p.ry = p.y; }
     p.rx += (p.x - p.rx) * .34;
     p.ry += (p.y - p.ry) * .34;
     const s = getSpriteAssetFor(p.characterKey || 'zlaty', p.weaponType || 'm4');
-    drawSpriteAt(p.rx,p.ry,p.ang||0,p.walk||0,!!p.moving,p.name||'HRÁČ','brightness(.50) contrast(1.20) saturate(.85)',p.hp,p.maxHp||60,s.img,s.ready);
-    if(p.chatText && Date.now() < (p.chatUntil||0)) drawWorldBubble(p.rx,p.ry-70,p.chatText,{maxChars:34,stroke:'#d20b1c'});
+    const remoteMaxHp = Number.isFinite(p.maxHp) ? p.maxHp : 60;
+    drawSpriteAt(p.rx,p.ry,p.ang||0,p.walk||0,!!p.moving,p.name||'HRÁČ','brightness(.50) contrast(1.20) saturate(.85)',p.hp,remoteMaxHp,s.img,s.ready);
+    ctx.save();
+    ctx.font='10px Arial Black';
+    ctx.textAlign='center';
+    ctx.fillStyle='rgba(255,224,122,.9)';
+    ctx.strokeStyle='rgba(0,0,0,.95)';
+    ctx.lineWidth=3;
+    const remoteDef = Math.round(((p.armorProtection||0)*100));
+    const remoteDmg = Math.round((((p.skillStrBonus||0)+(p.gearStrBonus||0))*100));
+    const weap = (loadoutDefs[p.weaponType] && loadoutDefs[p.weaponType].name) || (p.weaponType||'zbraň');
+    const ammoTxt = Number.isFinite(p.ammo) ? ('  ' + (p.ammo|0) + '/' + (p.reserve|0)) : '';
+    const upg = 'HP '+Math.round(remoteMaxHp)+'  DEF '+remoteDef+'%  DMG +'+remoteDmg+'%';
+    ctx.strokeText(upg,p.rx,p.ry-72);
+    ctx.fillText(upg,p.rx,p.ry-72);
+    ctx.strokeText(weap + ammoTxt,p.rx,p.ry-58);
+    ctx.fillText(weap + ammoTxt,p.rx,p.ry-58);
+    ctx.restore();
+    if(p.chatText && Date.now() < (p.chatUntil||0)) drawWorldBubble(p.rx,p.ry-94,p.chatText,{maxChars:34,stroke:'#d20b1c'});
   }
 }
 
@@ -657,6 +945,7 @@ const map = {
   decor: [],
   doors: []
 };
+let staticSolidRects = [];
 const lobbyData = {
   shop:{x:350,y:300,w:230,h:75},
   shopkeeper:{x:465,y:258,ang:Math.PI/2},
@@ -665,8 +954,8 @@ const lobbyData = {
   loadout:{x:170,y:600,w:110,h:44},
   statsBoard:{x:140,y:132,w:180,h:56},
   teammate:{x:250,y:520,ang:0,walk:0,moving:false,name:'PLAYER 2',tx:250,ty:520},
-  targetA:{x:675,y:575,ang:-Math.PI/2},
-  targetB:{x:760,y:575,ang:-Math.PI/2}
+  targetA:{x:660,y:875,ang:-Math.PI/2},
+  targetB:{x:760,y:875,ang:-Math.PI/2}
 };
 const fog = { cell: 48, cols: 0, rows: 0, seen: [] };
 const textures = { floor:null, floor2:null, floor3:null, tile:null, tileDark:null, vinyl:null, wall:null, wallDark:null, metal:null, wood:null, fabric:null, plastic:null, darkMetal:null, rug:null };
@@ -701,8 +990,44 @@ const cameraCandidates = [
   {x:2230,y:900,ang:Math.PI+.05},{x:120,y:1465,ang:-.16},{x:1185,y:1465,ang:-1.58},{x:2230,y:1465,ang:Math.PI-.18},
   {x:2920,y:900,ang:Math.PI+.10},{x:2920,y:1465,ang:Math.PI-.25},{x:115,y:1900,ang:.12},{x:1550,y:1900,ang:-1.57},{x:2920,y:1900,ang:Math.PI-.12}
 ];
-const missionName = 'MISE: ČERNÝ SKLAD';
-const missionId = 'cerny_sklad';
+const missionDefs = {
+  cerny_sklad:{key:'cerny_sklad',id:'cerny_sklad',name:'MISE: ČERNÝ SKLAD',title:'ČERNÝ SKLAD'},
+  vlak:{key:'vlak',id:'vlak',name:'MISE: NEKONEČNÝ PŘÍBĚH',title:'NEKONEČNÝ PŘÍBĚH'},
+  vytah:{key:'vytah',id:'vytah',name:'MISE: STÍNY PATRA',title:'STÍNY PATRA'},
+  arena:{key:'arena',id:'arena',name:'ARENA',title:'ARENA'},
+  chaos:{key:'chaos',id:'chaos',name:'EVENT: CHAOS',title:'CHAOS'}
+};
+let selectedMissionKey = localStorage.getItem('bullet_echo_selected_mission') || 'cerny_sklad';
+if(!missionDefs[selectedMissionKey]) selectedMissionKey = 'cerny_sklad';
+let missionName = missionDefs[selectedMissionKey].name;
+let missionId = missionDefs[selectedMissionKey].id;
+const missionElevator = {floor:0,active:false,t:0,target:0,door:0};
+function setSelectedMission(key,save=true){
+  if(!missionDefs[key]) key='cerny_sklad';
+  selectedMissionKey = key;
+  missionName = missionDefs[key].name;
+  missionId = missionDefs[key].id;
+  if(save) localStorage.setItem('bullet_echo_selected_mission', key);
+}
+const LOCAL_MISSION_PROGRESS_KEY = 'bullet_echo_mission_progress';
+function getMissionProgress(key){
+  let data = {};
+  try{ data = JSON.parse(localStorage.getItem(LOCAL_MISSION_PROGRESS_KEY) || '{}') || {}; }catch(e){}
+  const local = Math.max(0, Math.min(100, data[key] || 0));
+  const profile = player && player.missionProgress ? Math.max(0, Math.min(100, player.missionProgress[key] || 0)) : 0;
+  return Math.max(local, profile);
+}
+function setMissionProgress(key,pct){
+  pct = Math.max(0, Math.min(100, Math.round(pct||0)));
+  let data = {};
+  try{ data = JSON.parse(localStorage.getItem(LOCAL_MISSION_PROGRESS_KEY) || '{}') || {}; }catch(e){}
+  data[key] = Math.max(data[key] || 0, pct);
+  localStorage.setItem(LOCAL_MISSION_PROGRESS_KEY, JSON.stringify(data));
+  if(player && player.missionProgress){
+    player.missionProgress[key] = Math.max(player.missionProgress[key] || 0, pct);
+    try{ saveProgress(); }catch(e){}
+  }
+}
 const playerNick = 'PROJEKT SAS';
 const loadoutDefs = {
   m4: {
@@ -757,13 +1082,25 @@ loadoutOrder.forEach(key => {
   } else d.ready = true;
 });
 const equipmentDefs = {
-  vest:{key:'vest',name:'Vesta',slot:'tělo',hp:12,armor:.06,desc:'+12 HP, menší poškození'},
-  helmet:{key:'helmet',name:'Helma',slot:'hlava',hp:8,armor:.045,desc:'+8 HP, ochrana hlavy'},
-  boots:{key:'boots',name:'Boty',slot:'nohy',hp:5,armor:.025,desc:'+5 HP, pevnější krok'},
-  gloves:{key:'gloves',name:'Rukavice',slot:'ruce',hp:4,armor:.02,desc:'+4 HP, jistější úchop'},
-  pants:{key:'pants',name:'Kalhoty',slot:'nohy',hp:7,armor:.035,desc:'+7 HP, lehká ochrana'}
+  vest:{key:'vest',name:'Vesta',slot:'tělo',level:1,hp:12,armor:.06,str:0,desc:'+12 HP, menší poškození'},
+  helmet:{key:'helmet',name:'Helma',slot:'hlava',level:2,hp:8,armor:.045,str:0,desc:'+8 HP, ochrana hlavy'},
+  boots:{key:'boots',name:'Boty',slot:'nohy',level:2,hp:5,armor:.025,str:0,desc:'+5 HP, pevnější krok'},
+  gloves:{key:'gloves',name:'Rukavice',slot:'ruce',level:3,hp:4,armor:.02,str:0,desc:'+4 HP, jistější úchop'},
+  pants:{key:'pants',name:'Kalhoty',slot:'nohy',level:4,hp:7,armor:.035,str:0,desc:'+7 HP, lehká ochrana'},
+  laser:{key:'laser',name:'Laser',slot:'zbraň',level:3,hp:0,armor:0,str:0,imgPath:'gear_laser.png',desc:'rovný červený laser, G vypnout/zapnout'},
+  stock:{key:'stock',name:'Držák',slot:'zbraň',level:4,hp:0,armor:0,str:.03,imgPath:'gear_stock.png',desc:'+3 % síla, stabilnější zbraň'},
+  bipod:{key:'bipod',name:'Nožičky',slot:'zbraň',level:5,hp:10,armor:.01,str:.04,imgPath:'gear_bipod.png',desc:'+10 HP, +4 % síla'}
 };
-const equipmentOrder = ['vest','helmet','boots','gloves','pants'];
+const equipmentOrder = ['vest','helmet','boots','gloves','pants','laser','stock','bipod'];
+for(const key of equipmentOrder){
+  const d = equipmentDefs[key];
+  if(d && d.imgPath){
+    d.img = new Image();
+    d.ready = false;
+    d.img.onload = () => { d.ready = true; };
+    d.img.src = d.imgPath;
+  }
+}
 const characterDefs = {
   zlaty: {
     key:'zlaty',
@@ -800,22 +1137,22 @@ characterOrder.forEach(key => {
 });
 const weaponDefs = {
   m4: {
-    name: 'M4A1', clip: 30, reserve: 120, damage: 66, speed: 980, spread: .028, fireDelay: .11,
+    name: 'M4A1', clip: 30, reserve: 120, damage: 66, speed: 980, spread: .046, fireDelay: .16, recoil: 95,
     muzzleDist: 72, shellOffsetForward: 20, shellOffsetSide: -11, reloadTime: 1.35, pellets: 1,
     sound: soundPaths.weapons.ak47
   },
   sniper: {
-    name: 'Sniper', clip: 5, reserve: 25, damage: 160, speed: 1680, spread: .005, fireDelay: .95,
+    name: 'Sniper', clip: 5, reserve: 25, damage: 160, speed: 1680, spread: .013, fireDelay: 1.12, recoil: 180,
     muzzleDist: 82, shellOffsetForward: 22, shellOffsetSide: -10, reloadTime: 1.9, pellets: 1,
     sound: soundPaths.weapons.awp
   },
   lmg: {
-    name: 'Kulomet', clip: 65, reserve: 195, damage: 52, speed: 900, spread: .055, fireDelay: .09,
+    name: 'Kulomet', clip: 65, reserve: 195, damage: 52, speed: 900, spread: .078, fireDelay: .135, recoil: 115,
     muzzleDist: 76, shellOffsetForward: 22, shellOffsetSide: -10, reloadTime: 2.1, pellets: 1,
     sound: soundPaths.weapons.smg
   },
   shotgun: {
-    name: 'Shotgun', clip: 8, reserve: 40, damage: 34, speed: 860, spread: .07, fireDelay: .72,
+    name: 'Shotgun', clip: 8, reserve: 40, damage: 34, speed: 860, spread: .105, fireDelay: .88, recoil: 150,
     muzzleDist: 74, shellOffsetForward: 18, shellOffsetSide: -9, reloadTime: 1.65, pellets: 6,
     sound: soundPaths.weapons.shotgun
   },
@@ -863,6 +1200,17 @@ const ambientLights = [
   {x:1650,y:1810,r:86,a:.13},
   {x:2570,y:1810,r:90,a:.12}
 ];
+const basePatrolZones = patrolZones.map(z=>({...z}));
+const baseRoomVisuals = roomVisuals.map(r=>({...r,rugs:(r.rugs||[]).map(g=>({...g}))}));
+function applyMissionLayout(zones, visuals){
+  patrolZones.length = 0;
+  zones.forEach(z=>patrolZones.push({...z}));
+  roomVisuals.length = 0;
+  visuals.forEach(r=>roomVisuals.push({...r,rugs:(r.rugs||[]).map(g=>({...g}))}));
+}
+function restoreBaseLayout(){
+  applyMissionLayout(basePatrolZones, baseRoomVisuals);
+}
 function randomZone(){ return patrolZones[(Math.random()*patrolZones.length)|0]; }
 function randomPointInZone(z, pad=44){
   return { x: rand(z.x+pad, z.x+z.w-pad), y: rand(z.y+pad, z.y+z.h-pad) };
@@ -873,7 +1221,7 @@ function isSpawnClear(x,y,r=24){
   if(pointInWall(x,y)) return false;
   if(dist(x,y,player.x,player.y) < 300) return false;
   for(const o of map.decor){
-    if(['pipe','doorLight','plant','labelMission','labelLoadout'].includes(o.t)) continue;
+    if(['pipe','doorLight','plant','labelMission','labelLoadout','labelShop','labelSkills','labelHazard','labelArena'].includes(o.t)) continue;
     const nx = clamp(x,o.x,o.x+o.w), ny = clamp(y,o.y,o.y+o.h);
     if(Math.hypot(x-nx,y-ny) < r+34) return false;
   }
@@ -933,6 +1281,7 @@ function createEnemyAt(x,y,zone=null,kind=null){
     lastSeenX:x, lastSeenY:y, investigateX:x, investigateY:y,
     strafeDir:Math.random()<.5?-1:1, flashPhase:rand(0,Math.PI*2),
     buttonTarget:null, buttonTried:false, searchMapTimer:0,
+    path:null, pathTimer:0, pathGoalX:NaN, pathGoalY:NaN, stuck:0, lastMoveX:x, lastMoveY:y,
     bloodColor: ((spriteIndex===0 && kind!=='mirror') || kind==='mirror') ? 'yellow' : 'red',
     blood:[], corpseAnim:0, corpseAnimMax:.24, corpseDX:0, corpseDY:0, corpseRot:0,
     bleedTime:0, bleedNext:0
@@ -962,7 +1311,7 @@ function spawnReinforcementsNear(x,y,count=6){
     const e = enemies[enemies.length-1];
     e.alert = 3.8;
     e.state = 'investigate';
-    e.searchMapTimer = 0;
+    e.searchMapTimer = rand(.05,.75);
     const rz = randomZone();
     const rp = randomClearPointInZone(rz,80,35);
     e.zone = rz;
@@ -981,7 +1330,7 @@ function activateAlarmButton(b, byPlayer=false){
   b.used = true;
   for(const l of alarmBeacons) l.flash = 9.0;
   triggerSecurityAlarm(b.x,b.y,byPlayer?'player_button':'enemy_button');
-  spawnReinforcementsNear(b.x,b.y,6);
+  spawnReinforcementsNear(b.x,b.y,15);
   return true;
 }
 function updateAlarmButtons(dt){
@@ -1045,13 +1394,18 @@ function makeTextures(){
   textures.rug = makeTexture(54,'#3a2320','rgba(255,255,255,.03)','rgba(0,0,0,.06)');
 }
 function resetFog(){
+  minimapCanvas = null;
   fog.cols = Math.ceil(map.w / fog.cell);
   fog.rows = Math.ceil(map.h / fog.cell);
   fog.seen = new Uint8Array(fog.cols * fog.rows);
-  revealFog(player.x, player.y, 260);
+  if(selectedMissionKey==='arena' || selectedMissionKey==='chaos'){
+    fog.seen.fill(1);
+  } else {
+    revealFog(player.x, player.y, 360);
+  }
 }
 function fogIndex(cx,cy){ return cy*fog.cols + cx; }
-function revealFog(x,y,r=230){
+function revealFog(x,y,r=190){
   if(!fog.seen.length) return;
   const minX = clamp(Math.floor((x-r)/fog.cell),0,fog.cols-1);
   const maxX = clamp(Math.floor((x+r)/fog.cell),0,fog.cols-1);
@@ -1073,16 +1427,17 @@ function fogSeenAt(x,y){
 }
 function revealSharedFog(){
   if(gameMode !== 'mission') return;
-  revealFog(player.x, player.y, 300);
+  revealFog(player.x, player.y, 360);
   if(online.active){
     for(const p of Object.values(online.remotePlayers)){
       if(p && p.gameMode === 'mission' && Date.now() - (p.lastSeen||0) < 6500){
-        revealFog(p.x, p.y, 300);
+        revealFog(p.x, p.y, 360);
       }
     }
   }
 }
 function drawExplorationFog(){
+  if(selectedMissionKey==='arena') return;
   if(gameMode !== 'mission' || !fog.seen.length) return;
   ctx.save();
   ctx.fillStyle = '#000';
@@ -1101,10 +1456,11 @@ function drawExplorationFog(){
   ctx.restore();
 }
 
-function buildMap(){
+function buildMapSklad(){
+  restoreBaseLayout();
   map.w = 3100; map.h = 2100;
   resetShellLayer();
-  map.walls.length = 0; map.decor.length = 0; map.doors.length = 0; alarmButtons.length = 0; alarmBeacons.length = 0; alarmReinforcementsDone = false;
+  map.walls.length = 0; map.decor.length = 0; map.doors.length = 0; staticSolidRects.length = 0; alarmButtons.length = 0; alarmBeacons.length = 0; alarmReinforcementsDone = false;
   wall(-20,-20,map.w+40,20); wall(-20,map.h,map.w+40,20); wall(-20,0,20,map.h); wall(map.w,0,20,map.h);
   wall(0,0,3100,70); wall(0,2030,3100,70); wall(0,0,70,2100); wall(3030,0,70,2100);
 
@@ -1191,59 +1547,536 @@ function buildMap(){
     decor(x,y,ww,hh,t);
     placed++;
   }
+  rebuildStaticSolids();
 }
 
+
+
+function buildMapTrain(){
+  const zones=[
+    {x:125,y:125,w:520,h:240},{x:700,y:125,w:520,h:240},{x:1275,y:125,w:520,h:240},
+    {x:1850,y:125,w:520,h:240},{x:2425,y:125,w:520,h:240}
+  ];
+  const visuals=zones.map((z,i)=>({x:z.x,y:z.y,w:z.w,h:z.h,floor:i%2?'floor2':'tileDark',rugs:[{x:z.x+185,y:z.y+78,w:150,h:88,c:i%2?'#2a2f3d':'#3d2417'}]}));
+  applyMissionLayout(zones,visuals);
+  map.w=3120; map.h=620;
+  resetShellLayer();
+  map.walls.length=0; map.decor.length=0; map.doors.length=0; staticSolidRects.length=0; alarmButtons.length=0; alarmBeacons.length=0; alarmReinforcementsDone=false;
+
+  // vlak v hlavním enginu: stejná AI, zbraně, inventář, fog, alarmy, parťák, online sync
+  // bez vnějších zdí okolo – zůstávají jen samotné vagóny
+
+  for(let i=0;i<5;i++){
+    const x=125+i*575;
+    wall(x,105,520,30); wall(x,365,520,30);
+    if(i===0) wall(x,105,30,92), wall(x,303,30,92);
+    else { wall(x,105,30,92); wall(x,303,30,92); }
+    // otevřený střed pro průchod vagónem
+    wall(x+490,105,30,92); wall(x+490,303,30,92);
+    door(x+520,206,55,90);
+    // levý konec prvního vagónu
+    if(i===0) door(x-55,206,55,90);
+
+    decor(x+70,150,92,42,'table'); decor(x+70,302,92,42,'table');
+    decor(x+210,150,92,42,'cabinet'); decor(x+210,302,92,42,'cabinet');
+    decor(x+355,150,72,42,'crate'); decor(x+355,302,72,42,'crate');
+    decor(x+120,220,56,42,'chair'); decor(x+300,220,56,42,'chair');
+    // okna a koleje jako vizuál bez změny funkcí
+    for(let k=0;k<4;k++){ decor(x+60+k*95,96,62,10,'pipe'); decor(x+60+k*95,396,62,10,'pipe'); }
+  }
+  alarmButton(2890,250,Math.PI);
+  alarmBeacon(310,94); alarmBeacon(890,94); alarmBeacon(1470,94); alarmBeacon(2050,94); alarmBeacon(2630,94);
+  rebuildStaticSolids();
+}
+function buildElevatorFloorLayout(){
+  const f = missionElevator.floor|0;
+  const zones=[
+    {x:120,y:120,w:420,h:265},{x:610,y:120,w:380,h:265},
+    {x:120,y:455,w:420,h:250},{x:610,y:455,w:380,h:250},
+    {x:1015,y:260,w:150,h:170}
+  ];
+  const visuals=zones.map((z,i)=>({x:z.x,y:z.y,w:z.w,h:z.h,floor:(f+i)%2?'floor2':'tile',rugs:[{x:z.x+70,y:z.y+75,w:Math.min(180,z.w-130),h:92,c:i%2?'#24343e':'#3b2417'}]}));
+  applyMissionLayout(zones,visuals);
+}
+function buildMapElevator(){
+  buildElevatorFloorLayout();
+  map.w=1280; map.h=820;
+  resetShellLayer();
+  map.walls.length=0; map.decor.length=0; map.doors.length=0; staticSolidRects.length=0; alarmButtons.length=0; alarmBeacons.length=0; alarmReinforcementsDone=false;
+
+  // patro 1 / patro 2: jen okrajové zdi, bez vnitřních zdí; krytí je nábytek
+  wall(-20,-20,map.w+40,20); wall(-20,map.h,map.w+40,20); wall(-20,0,20,map.h); wall(map.w,0,20,map.h);
+  wall(70,70,1140,55); wall(70,695,1140,55); wall(70,70,55,680); wall(1155,70,55,680);
+
+  // výtah jako větší kabina / místnost – stejné místo, jen zvětšený, aby se hráč nezasekl
+  decor(972,214,248,272,'elevatorCabin');
+  decor(1020,268,108,102,'panel');
+  decor(1148,420,34,34,'doorLight');
+
+  if((missionElevator.floor|0)===0){
+    decor(155,150,150,58,'table'); decor(350,170,95,58,'crate'); decor(170,285,120,52,'cabinet'); decor(420,300,92,52,'chair');
+    decor(645,150,170,58,'table'); decor(860,170,86,58,'crate'); decor(680,300,135,52,'cabinet'); decor(870,315,72,52,'chair');
+    decor(150,510,165,58,'table'); decor(365,525,95,58,'crate'); decor(470,600,72,52,'chair');
+    decor(650,510,160,58,'cabinet'); decor(850,530,98,58,'crate'); decor(720,620,100,52,'table');
+  } else {
+    decor(155,150,150,58,'cabinet'); decor(355,155,110,58,'crate'); decor(210,295,145,52,'table'); decor(450,305,82,52,'chair');
+    decor(650,140,165,58,'table'); decor(850,160,95,58,'cabinet'); decor(700,300,150,52,'crate');
+    decor(135,515,190,58,'table'); decor(370,520,120,58,'cabinet'); decor(500,615,84,52,'crate');
+    decor(665,515,190,58,'table'); decor(890,535,110,58,'crate'); decor(730,625,110,52,'cabinet');
+  }
+  alarmButton(1148,420,Math.PI);
+  alarmBeacon(190,110); alarmBeacon(740,110); alarmBeacon(190,690); alarmBeacon(740,690); alarmBeacon(1086,220);
+  rebuildStaticSolids();
+}
+
+const CHAOS_EVENT_MS = 12*60*60*1000;
+function chaosEventInfo(){
+  const n = Date.now();
+  const slot = Math.floor(n / CHAOS_EVENT_MS);
+  const active = (slot % 2) === 0;
+  const ends = (slot + 1) * CHAOS_EVENT_MS;
+  return {active, remaining:Math.max(0,ends-n)};
+}
+function formatCountdown(ms){
+  const s=Math.max(0,Math.floor(ms/1000));
+  const h=Math.floor(s/3600), m=Math.floor((s%3600)/60), ss=s%60;
+  return String(h).padStart(2,'0')+':'+String(m).padStart(2,'0')+':'+String(ss).padStart(2,'0');
+}
+function onlineFriendCount(){
+  if(!online.active) return 0;
+  let n=0;
+  for(const p of Object.values(online.remotePlayers||{})){
+    if(p && Date.now()-(p.lastSeen||0)<9000) n++;
+  }
+  return n;
+}
+function randomClearPointSide(side){
+  for(let i=0;i<80;i++){
+    const x = side==='left' ? rand(180,620) : rand(map.w-620,map.w-180);
+    const y = rand(160,map.h-160);
+    if(!blockedCircle(x,y,24)) return {x,y};
+  }
+  return side==='left' ? {x:260,y:map.h/2} : {x:map.w-260,y:map.h/2};
+}
+function buildMapChaos(){
+  map.w=2200; map.h=1180;
+  resetShellLayer();
+  map.walls.length=0; map.decor.length=0; map.doors.length=0; staticSolidRects.length=0; alarmButtons.length=0; alarmBeacons.length=0; alarmReinforcementsDone=false;
+  friendlyBots=[]; chaosTurrets=[];
+  wall(-20,-20,map.w+40,20); wall(-20,map.h,map.w+40,20); wall(-20,0,20,map.h); wall(map.w,0,20,map.h);
+  wall(80,80,map.w-160,30); wall(80,map.h-110,map.w-160,30); wall(80,80,30,map.h-160); wall(map.w-110,80,30,map.h-160);
+  door(map.w/2-70,80,140,30); door(map.w/2-70,map.h-110,140,30); door(80,map.h/2-70,30,140); door(map.w-110,map.h/2-70,30,140);
+  const cover = [
+    [380,260,150,62,'crate'],[680,230,120,58,'cabinet'],[1000,245,150,58,'table'],[1300,220,115,58,'crate'],[1660,260,150,62,'crate'],
+    [320,520,130,70,'cabinet'],[590,530,145,62,'crate'],[870,520,130,58,'table'],[1160,520,130,58,'table'],[1450,530,145,62,'crate'],[1740,520,130,70,'cabinet'],
+    [380,820,150,62,'crate'],[720,845,120,58,'cabinet'],[1035,820,150,58,'table'],[1345,845,120,58,'cabinet'],[1660,820,150,62,'crate'],
+    [980,650,210,70,'ammoBox']
+  ];
+  for(const c of cover) decor(c[0],c[1],c[2],c[3],c[4]);
+  chaosTurrets.push(
+    {team:'friendly',x:190,y:230,r:26,hp:130,maxHp:130,ang:0,shootCd:.5,muzzleFx:0},
+    {team:'friendly',x:190,y:map.h-230,r:26,hp:130,maxHp:130,ang:0,shootCd:.8,muzzleFx:0},
+    {team:'enemy',x:map.w-190,y:230,r:26,hp:130,maxHp:130,ang:Math.PI,shootCd:.7,muzzleFx:0},
+    {team:'enemy',x:map.w-190,y:map.h-230,r:26,hp:130,maxHp:130,ang:Math.PI,shootCd:1.0,muzzleFx:0}
+  );
+  const zones=[
+    {x:120,y:120,w:820,h:900},
+    {x:940,y:120,w:320,h:900},
+    {x:1260,y:120,w:820,h:900}
+  ];
+  const visuals=zones.map((z,i)=>({x:z.x,y:z.y,w:z.w,h:z.h,floor:i===1?'tileDark':'floor2',rugs:[{x:z.x+120,y:z.y+180,w:220,h:110,c:i===1?'#292929':(i?'#3b1717':'#172f3b')}]}));
+  applyMissionLayout(zones,visuals);
+  rebuildStaticSolids();
+}
+function spawnChaosMatch(){
+  enemies=[]; friendlyBots=[]; bullets=[]; grenades=[]; explosions=[]; particles=[];
+  const friendBots = Math.max(0,14 - Math.min(1,onlineFriendCount()));
+  const names=['Karel','Roman','Viktor','Igor','Alex','Marek','Denis','Patrik','David','Tonda','Fanda','Jirka','Pavel','Milan','Radek','Boris','Lukáš','Kuba'];
+  for(let i=0;i<friendBots;i++){
+    const p=randomClearPointSide('left');
+    friendlyBots.push({x:p.x,y:p.y,r:20,ang:0,hp:95,maxHp:95,shootCd:rand(.2,1.4),walk:0,moving:false,name:names[(Math.random()*names.length)|0]+' '+(1+i)});
+  }
+  for(let i=0;i<15;i++){
+    const p=randomClearPointSide('right');
+    const z=randomZone();
+    createEnemyAt(p.x,p.y,z);
+    const e=enemies[enemies.length-1];
+    e.alert=4; e.state='engage'; e.investigateX=map.w*.35; e.investigateY=rand(160,map.h-160); e.ang=Math.PI+rand(-.4,.4);
+    e.coverTimer=rand(.5,2.0);
+  }
+  chaosSpawned=true;
+  wave=1;
+  message='CHAOS ZAČAL';
+  messageTimer=2.0;
+}
+function nearestAliveEnemy(x,y,maxD=99999){
+  let best=null,bd=maxD;
+  for(const e of enemies){
+    if(e.hp<=0) continue;
+    const d=dist(x,y,e.x,e.y);
+    if(d<bd){bd=d;best=e;}
+  }
+  return best;
+}
+function nearestAliveFriendly(x,y,maxD=99999){
+  let best=null,bd=maxD;
+  if(!player.dead){
+    const d=dist(x,y,player.x,player.y);
+    if(d<bd){bd=d;best=player;}
+  }
+  for(const f of friendlyBots){
+    if(f.hp<=0) continue;
+    const d=dist(x,y,f.x,f.y);
+    if(d<bd){bd=d;best=f;}
+  }
+  return best;
+}
+function nearestCoverPoint(x,y){
+  let best=null,bd=999999;
+  for(const d of map.decor){
+    if(!['crate','cabinet','table','ammoBox'].includes(d.t)) continue;
+    const cx=d.x+d.w/2, cy=d.y+d.h/2;
+    const dd=dist(x,y,cx,cy);
+    if(dd<bd){bd=dd; best={x:cx+(x<cx?-70:70), y:cy+(y<cy?-40:40)};}
+  }
+  return best || {x,y};
+}
+function killFriendly(f,ang=0){
+  if(!f || f.hp<=0) return;
+  f.hp=0; f.corpseDX=Math.cos(ang)*rand(12,28); f.corpseDY=Math.sin(ang)*rand(12,28); f.corpseRot=rand(-.9,.9);
+  addBloodDecal(f.x+rand(-16,16),f.y+rand(-16,16),rand(20,36),false,ang,'red');
+}
+function updateChaosTurrets(dt,simDt){
+  if(selectedMissionKey!=='chaos' || !chaosSpawned) return;
+  for(const t of chaosTurrets){
+    if(t.hp<=0) continue;
+    t.shootCd=Math.max(0,t.shootCd-simDt); t.muzzleFx=Math.max(0,t.muzzleFx-dt*2);
+    const target = t.team==='friendly' ? nearestAliveEnemy(t.x,t.y,850) : nearestAliveFriendly(t.x,t.y,850);
+    if(!target) continue;
+    const a=angleTo(t.x,t.y,target.x,target.y);
+    t.ang += angleDiff(a,t.ang)*clamp(simDt*8,0,.9);
+    if(los(t.x,t.y,target.x,target.y,8) && t.shootCd<=0){
+      t.shootCd=.22+Math.random()*.12;
+      t.muzzleFx=.1;
+      shoot(t.team==='friendly'?'a':'e',t.x,t.y,t.ang,t.team==='friendly'?48:62,820,.06);
+    }
+  }
+}
+function updateFriendlyBots(dt,simDt){
+  if(selectedMissionKey!=='chaos' || !chaosSpawned) return;
+  for(const f of friendlyBots){
+    if(f.hp<=0){ f.walk+=dt*.2; continue; }
+    const target=nearestAliveEnemy(f.x,f.y,1200);
+    f.shootCd=Math.max(0,f.shootCd-simDt);
+    if(!target){ f.moving=false; continue; }
+    f.ang=angleTo(f.x,f.y,target.x,target.y);
+    const d=dist(f.x,f.y,target.x,target.y);
+    if(d>260){
+      const v=steerVelocity(f,Math.cos(f.ang)*190,Math.sin(f.ang)*190,simDt);
+      moveCircle(f,v.vx,v.vy,simDt); f.moving=true; f.walk+=dt*11;
+    } else f.moving=false;
+    if(d<620 && los(f.x,f.y,target.x,target.y,8) && f.shootCd<=0){
+      f.shootCd=.32+Math.random()*.24;
+      shoot('a',f.x,f.y,f.ang,44,880,.08);
+    }
+  }
+}
+function updateChaosEnemies(dt,simDt){
+  if(selectedMissionKey!=='chaos' || !chaosSpawned) return;
+  for(const e of enemies){
+    if(e.hp<=0) continue;
+    const target=nearestAliveFriendly(e.x,e.y,1300);
+    if(!target) continue;
+    const d=dist(e.x,e.y,target.x,target.y);
+    const a=angleTo(e.x,e.y,target.x,target.y);
+    e.ang += angleDiff(a,e.ang)*clamp(simDt*6,0,.85);
+    e.shootCd=Math.max(0,e.shootCd-simDt);
+    if(d<620 && los(e.x,e.y,target.x,target.y,8)){
+      if(e.shootCd<=0){
+        e.shootCd=.36+Math.random()*.32;
+        e.muzzleFx=.09;
+        shoot('e',e.x,e.y,e.ang,62,760,.12);
+      }
+      if(Math.random()<simDt*.55){
+        const c=nearestCoverPoint(e.x,e.y);
+        const ca=angleTo(e.x,e.y,c.x,c.y);
+        moveCircle(e,Math.cos(ca)*e.spd*.30,Math.sin(ca)*e.spd*.30,simDt);
+      }
+    } else {
+      const v=steerVelocity(e,Math.cos(e.ang)*e.spd*.55,Math.sin(e.ang)*e.spd*.55,simDt);
+      moveCircle(e,v.vx,v.vy,simDt);
+    }
+  }
+}
+function updateChaosBattle(dt,simDt){
+  if(selectedMissionKey!=='chaos') return;
+  if(chaosCountdown>0){
+    chaosCountdown=Math.max(0,chaosCountdown-dt);
+    message='CHAOS START ZA '+Math.ceil(chaosCountdown);
+    messageTimer=.25;
+    if(chaosCountdown<=0 && !chaosSpawned) spawnChaosMatch();
+    return;
+  }
+  updateFriendlyBots(dt,simDt);
+  updateChaosEnemies(dt,simDt);
+  updateChaosTurrets(dt,simDt);
+  if(chaosSpawned && enemies.length && enemies.every(e=>e.hp<=0)){
+    message='CHAOS VYHRÁN';
+    messageTimer=2;
+    setMissionProgress('chaos',100);
+  }
+}
+function drawFriendlyBots(){
+  if(selectedMissionKey!=='chaos') return;
+  for(const f of friendlyBots){
+    if(!isOnScreen(f.x,f.y,140)) continue;
+    drawSpriteAt(f.x,f.y,f.ang||0,f.walk||0,!!f.moving,f.name||'FRIENDLY','brightness(.74) contrast(1.15) saturate(.95)',f.hp,f.maxHp,playerSprite,playerSpriteReady);
+  }
+}
+function drawChaosTurrets(){
+  if(selectedMissionKey!=='chaos') return;
+  for(const t of chaosTurrets){
+    if(!isOnScreen(t.x,t.y,120)) continue;
+    ctx.save();
+    ctx.translate(t.x,t.y); ctx.rotate(t.ang-Math.PI/2);
+    ctx.fillStyle=t.team==='friendly'?'#1f4f86':'#72111a'; ctx.strokeStyle='#ddd'; ctx.lineWidth=3;
+    ctx.beginPath(); ctx.ellipse(0,0,18,26,0,0,Math.PI*2); ctx.fill(); ctx.stroke();
+    ctx.fillStyle='#111'; ctx.fillRect(-6,0,12,48); ctx.strokeRect(-6,0,12,48);
+    if(t.muzzleFx>0){ ctx.fillStyle='rgba(255,240,180,.7)'; ctx.beginPath(); ctx.arc(0,54,18,0,Math.PI*2); ctx.fill(); }
+    ctx.rotate(Math.PI/2-t.ang);
+    ctx.font='11px Arial Black'; ctx.textAlign='center'; ctx.fillStyle='#fff'; ctx.strokeStyle='#000'; ctx.lineWidth=3;
+    ctx.strokeText(t.team==='friendly'?'ALLY TURRET':'ENEMY TURRET',0,-38); ctx.fillText(t.team==='friendly'?'ALLY TURRET':'ENEMY TURRET',0,-38);
+    ctx.restore();
+  }
+}
+
+function buildMapArena(){
+  map.w=1420; map.h=920;
+  resetShellLayer();
+  map.walls.length=0; map.decor.length=0; map.doors.length=0; staticSolidRects.length=0; alarmButtons.length=0; alarmBeacons.length=0; alarmReinforcementsDone=false;
+  wall(-20,-20,map.w+40,20); wall(-20,map.h,map.w+40,20); wall(-20,0,20,map.h); wall(map.w,0,20,map.h);
+  wall(90,90,map.w-180,28); wall(90,map.h-118,map.w-180,28); wall(90,90,28,map.h-180); wall(map.w-118,90,28,map.h-180);
+  door(676,90,90,28); door(676,map.h-118,90,28); door(90,416,28,90); door(map.w-118,416,28,90);
+  decor(250,210,150,58,'table'); decor(470,180,110,58,'crate'); decor(720,210,150,58,'cabinet');
+  decor(980,190,120,58,'crate'); decor(300,600,160,58,'cabinet'); decor(560,620,150,58,'table');
+  decor(840,610,165,58,'table'); decor(1080,610,120,58,'crate'); decor(1210,270,95,52,'chair');
+  decor(650,430,130,70,'ammoBox');
+  rebuildStaticSolids();
+}
+function buildMap(){
+  if(selectedMissionKey==='vlak') buildMapTrain();
+  else if(selectedMissionKey==='vytah') buildMapElevator();
+  else if(selectedMissionKey==='arena') buildMapArena();
+  else if(selectedMissionKey==='chaos') buildMapChaos();
+  else buildMapSklad();
+}
+function missionStartPoint(){
+  if(selectedMissionKey==='vlak') return {x:180,y:250};
+  if(selectedMissionKey==='vytah') return {x:1096,y:380};
+  if(selectedMissionKey==='arena') return {x:210,y:450};
+  if(selectedMissionKey==='chaos') return {x:220,y:map.h/2};
+  return {x:180,y:590};
+}
+function missionClientStartPoint(){
+  const p=missionStartPoint();
+  return {x:p.x+65,y:p.y};
+}
+function nearMissionElevatorButton(){
+  return selectedMissionKey==='vytah' && dist(player.x,player.y,1148,420)<92;
+}
+function startMissionElevator(){
+  if(selectedMissionKey!=='vytah' || missionElevator.active) return false;
+  if((missionElevator.floor|0)===1){ message='UŽ JSI V PATŘE 2'; messageTimer=1.2; return true; }
+  if(enemies.some(e=>e.hp>0)){ message='NEJDŘÍV VYČISTI PATRO'; messageTimer=1.3; return true; }
+  missionElevator.active=true; missionElevator.t=0; missionElevator.target=1; missionElevator.door=0;
+  message='DVEŘE SE ZAVÍRAJÍ'; messageTimer=1.2;
+  return true;
+}
+function updateMissionElevator(dt){
+  if(selectedMissionKey!=='vytah') return false;
+  if(keys.e && nearMissionElevatorButton()){ keys.e=false; startMissionElevator(); }
+  if(!missionElevator.active) return false;
+  missionElevator.t += dt;
+  if(missionElevator.t < .75){
+    missionElevator.door = clamp(missionElevator.t/.75,0,1);
+  } else if(missionElevator.t < 2.6){
+    missionElevator.door = 1;
+    shake = Math.max(shake,1.25);
+    player.x=1096; player.y=380; player.safeX=player.x; player.safeY=player.y;
+  } else if(missionElevator.t < 3.35){
+    if((missionElevator.floor|0)!==missionElevator.target){
+      missionElevator.floor = missionElevator.target;
+      enemies=[]; turrets=[]; cameras=[]; bullets=[]; grenades=[]; explosions=[]; craters=[]; particles=[]; pickups=[]; shells=[]; bulletMarks=[]; bloodDecals=[];
+      buildMap(); spawnWave(); spawnSecurity(); setupCompanion(); resetFog();
+      player.x=1096; player.y=380; player.safeX=player.x; player.safeY=player.y;
+      revealFog(player.x,player.y,260);
+      setMissionProgress('vytah',50);
+    }
+    missionElevator.door = clamp(1-(missionElevator.t-2.6)/.75,0,1);
+  } else {
+    missionElevator.active=false; missionElevator.door=0;
+    message='PATRO 2'; messageTimer=1.3;
+  }
+  return true;
+}
+function drawMissionElevatorOverlay(){
+  if(selectedMissionKey!=='vytah') return;
+  if(nearMissionElevatorButton() && !missionElevator.active){
+    ctx.save(); ctx.font='28px Impact'; ctx.textAlign='center'; ctx.strokeStyle='#000'; ctx.lineWidth=6; ctx.fillStyle='#fff';
+    ctx.strokeText('E  PANEL VÝTAHU',W/2,H-116); ctx.fillText('E  PANEL VÝTAHU',W/2,H-116); ctx.restore();
+  }
+  if(gameMode==='mission'){
+    const x1 = 1010, y = 458, half = 80 * missionElevator.door;
+    ctx.save();
+    ctx.fillStyle='#080808'; ctx.strokeStyle='#777'; ctx.lineWidth=3;
+    ctx.fillRect(x1,y,half,28); ctx.fillRect(1162-half,y,half,28);
+    ctx.strokeRect(x1,y,half,28); ctx.strokeRect(1162-half,y,half,28);
+    ctx.restore();
+  }
+  if(!missionElevator.active) return;
+  const p=clamp(missionElevator.t/3.35,0,1);
+  ctx.save();
+  ctx.fillStyle='rgba(0,0,0,'+(0.28+0.48*Math.sin(p*Math.PI))+')';
+  ctx.fillRect(0,0,W,H);
+  const y=H/2 + Math.sin(p*Math.PI*10)*7;
+  ctx.strokeStyle='#d20b1c'; ctx.lineWidth=5; ctx.strokeRect(W/2-165,H/2-110,330,220);
+  ctx.font='44px Impact'; ctx.textAlign='center'; ctx.fillStyle='#fff'; ctx.strokeStyle='#000'; ctx.lineWidth=7;
+  ctx.strokeText('VÝTAH JEDE',W/2,y-145); ctx.fillText('VÝTAH JEDE',W/2,y-145);
+  ctx.font='24px Impact'; ctx.fillStyle='#ffe07a';
+  ctx.strokeText('PATRO 1  →  PATRO 2',W/2,y+150); ctx.fillText('PATRO 1  →  PATRO 2',W/2,y+150);
+  ctx.restore();
+}
 
 function buildLobbyMap(){
-  map.w = 1280; map.h = 820;
+  map.w = 1900; map.h = 1120;
   resetShellLayer();
-  map.walls.length = 0; map.decor.length = 0; map.doors.length = 0;
+  map.walls.length = 0; map.decor.length = 0; map.doors.length = 0; staticSolidRects.length = 0;
 
-  // čistá lobby místnost
+  // větší, čistší lobby místnost
   wall(-20,-20,map.w+40,20); wall(-20,map.h,map.w+40,20); wall(-20,0,20,map.h); wall(map.w,0,20,map.h);
   wall(0,0,map.w,70); wall(0,map.h-70,map.w,70); wall(0,0,70,map.h); wall(map.w-70,0,70,map.h);
+  wall(70,70,map.w-140,28); wall(70,map.h-98,map.w-140,28);
+  wall(70,70,28,map.h-140); wall(map.w-98,70,28,map.h-140);
 
-  // lehké vnitřní hrany bez bludiště
-  wall(70,70,1140,28); wall(70,722,1140,28);
-  wall(70,70,28,680); wall(1182,70,28,680);
+  // obchodník vlevo nahoře
+  decor(300,300,270,82,'table');
+  decor(320,383,230,38,'shelf');
+  decor(285,250,70,44,'crate');
+  decor(535,250,70,44,'crate');
+  decor(235,410,95,42,'cabinet');
+  decor(620,375,70,42,'crate');
+  decor(620,450,130,42,'sofa');
 
-  // obchodník za pultem
-  decor(335,305,270,82,'table');
-  decor(355,388,230,38,'shelf');
-  decor(320,255,70,44,'crate');
-  decor(570,255,70,44,'crate');
+  // mise uprostřed nahoře
+  decor(760,290,245,88,'table');
+  decor(845,245,72,42,'panel');
+  decor(840,395,36,36,'chair');
+  decor(1030,320,45,45,'plant');
+  decor(805,205,145,34,'labelMission');
 
-  // stůl s PC, židle, kytka
-  decor(790,305,235,86,'table');
-  decor(870,260,70,42,'panel');
-  decor(850,405,36,36,'chair');
-  decor(1045,330,45,45,'plant');
-  decor(835,220,130,34,'labelMission');
-  decor(142,555,160,34,'labelLoadout');
+  // vybavení dole vlevo
+  decor(160,635,120,48,'cabinet');
+  decor(96,590,170,34,'labelLoadout');
+  decor(320,690,115,44,'crate');
 
-  // čistý nábytek
+  // skill stůl dole uprostřed
+  decor(530,640,230,74,'table');
+  decor(548,595,190,34,'labelSkills');
+  decor(585,720,34,34,'chair');
+  decor(780,705,50,44,'crate');
+
+  // hazard v pravém dolním rohu
+  decor(1110,650,215,82,'table');
+  decor(1320,675,42,42,'chair');
+  decor(1060,760,120,42,'sofa');
+  decor(1350,760,70,52,'crate');
+
+  // arena box
+  decor(900,615,165,74,'cabinet');
+  decor(920,575,125,34,'labelArena');
+
+  // příběhový parťák v pravém horním rohu
+  decor(1180,170,155,44,'sofa');
+  decor(1280,245,48,48,'plant');
+  decor(1340,185,82,44,'crate');
+
+  // další vězeňské buňky
+  const cells = [
+    {x:1540,y:150,w:270,h:118,nx:1675,ny:210},
+    {x:1540,y:300,w:270,h:118,nx:1675,ny:360},
+    {x:1540,y:450,w:270,h:118,nx:1675,ny:510},
+    {x:1540,y:600,w:270,h:118,nx:1675,ny:660}
+  ];
+  lobbyData.prisonNpcs = [];
+  for(const c of cells){
+    wall(c.x,c.y,c.w,16); wall(c.x,c.y+c.h,c.w,16); wall(c.x,c.y,16,c.h+16); wall(c.x+c.w,c.y,16,c.h+16);
+    decor(c.x+28,c.y+30,c.w-56,58,'bars');
+    decor(c.x+38,c.y+c.h-40,62,32,'crate');
+    lobbyData.prisonNpcs.push({x:c.nx,y:c.ny,ang:Math.PI});
+  }
+
+  // dekorace a volný střed
   decor(180,150,130,42,'sofa');
-  decor(960,150,145,38,'shelf');
-  decor(170,600,110,44,'cabinet');
-  decor(1030,610,90,54,'crate');
+  decor(560,145,145,38,'shelf');
+  decor(980,148,170,38,'shelf');
 
-  lobbyData.shop = {x:335,y:305,w:270,h:82};
-  lobbyData.shopkeeper = {x:470,y:252,ang:Math.PI/2};
-  lobbyData.missionDesk = {x:790,y:305,w:235,h:86};
-  lobbyData.pc = {x:870,y:260,w:70,h:42};
-  lobbyData.loadout = {x:170,y:600,w:110,h:44};
-  lobbyData.statsBoard = {x:140,y:132,w:180,h:56};
+  if(!lobbyData.prisonNpcs) lobbyData.prisonNpcs = [];
+  lobbyData.prisonNpc = lobbyData.prisonNpcs[0] || null;
+  lobbyData.shop = {x:300,y:300,w:270,h:82};
+  lobbyData.shopkeeper = {x:435,y:247,ang:Math.PI/2};
+  lobbyData.gambler = {x:1218,y:602,ang:Math.PI};
+  lobbyData.storyNpc = {x:1258,y:250,ang:-Math.PI/2};
+  lobbyData.missionDesk = {x:760,y:290,w:245,h:88};
+  lobbyData.pc = {x:845,y:245,w:72,h:42};
+  lobbyData.loadout = {x:160,y:635,w:120,h:48};
+  lobbyData.skills = {x:530,y:640,w:230,h:74};
+  lobbyData.arena = {x:900,y:615,w:165,h:74};
+  lobbyData.trainer = {x:790,y:850,ang:Math.PI};
+  lobbyData.eventNpc = {x:1040,y:850,ang:Math.PI};
+  lobbyData.targetA = {x:660,y:875,ang:-Math.PI/2};
+  lobbyData.targetB = {x:760,y:875,ang:-Math.PI/2};
+  lobbyData.statsBoard = {x:140,y:132,w:220,h:88};
   lobbyData.teammate = {x:260,y:520,ang:0,walk:0,moving:false,name:'PLAYER 2',tx:260,ty:520};
+  rebuildStaticSolids();
 }
+
+
+function dailyRewardReady(){
+  const last = Math.max(0, Number(player.dailyRewardAt || localStorage.getItem('bullet_echo_daily_reward_at') || 0));
+  return Date.now() - last >= 24*60*60*1000;
+}
+function openDailyRewardIfReady(){
+  if(gameMode==='lobby' && dailyRewardReady()){
+    lobbyUi = 'daily';
+  }
+}
+function claimDailyReward(){
+  if(!dailyRewardReady()){
+    lobbyUi = null;
+    return false;
+  }
+  const now = Date.now();
+  player.dailyRewardAt = now;
+  localStorage.setItem('bullet_echo_daily_reward_at', String(now));
+  awardTokens(1);
+  saveProgress();
+  lobbyUi = null;
+  message = 'DENNÍ ODMĚNA: +1 TOKEN';
+  messageTimer = 1.8;
+  return true;
+}
+
 function enterLobby(){
+  cmdLog('LOBBY','enterLobby');
   gameMode = 'lobby';
   lobbyUi = null;
   buildLobbyMap();
   initLobbyTargets();
+  try{ saveProgress(); }catch(e){}
   enemies = []; turrets = []; cameras = []; bullets = []; grenades = []; explosions = []; craters = []; particles = []; pickups = []; shells = []; bulletMarks = []; bloodDecals = [];
   securityAlarm = {x:0,y:0,timer:0,source:''};
   recalcEquipmentStats();
-  player.x=210; player.y=540; player.ang=0; player.hp=player.maxHp;
+  player.x=210; player.y=540; player.safeX=player.x; player.safeY=player.y; player.ang=0; player.hp=player.maxHp;
   applyLoadout(player.weaponType, false, true);
   refillInventoryAmmo();
   player.dead=false; player.reload=0; player.shootCd=0; player.muzzleFx=0; player.moving=false;
@@ -1255,19 +2088,189 @@ function enterLobby(){
   messageTimer=1.2;
   camera.x = clamp(player.x - W/2, 0, Math.max(0,map.w-W));
   camera.y = clamp(player.y - H/2, 0, Math.max(0,map.h-H));
+  openDailyRewardIfReady();
+}
+function startMissionLoading(done){
+  state = 'missionLoading';
+  preload.done = false;
+  preload.active = true;
+  startPreload('mission', ()=>{
+    try{ done && done(); cmdLog('MISSION','loaded'); }
+    catch(e){ cmdLog('ERROR','mission start failed',e && (e.message||String(e))); state='menu'; menuStep='main'; }
+  });
 }
 function startMissionFromLobby(){
   if(online.active){
     if(startOnlineMission()) return;
   }
   lobbyUi = null;
-  gameMode = 'mission';
-  resetGame();
-  state='play';
+  startMissionLoading(()=>{
+    gameMode = 'mission';
+    resetGame();
+    state='play';
+  });
 }
 function nearRect(cx,cy,r,rect){
   return cx > rect.x-r && cx < rect.x+rect.w+r && cy > rect.y-r && cy < rect.y+rect.h+r;
 }
+function inventoryKeys(){
+  const keys=[];
+  const inv=player.inventoryItems||{};
+  for(const k of Object.keys(inv)){ if((inv[k]|0)>0) keys.push(k); }
+  return keys;
+}
+function getInventoryCardRects(){
+  const cards=[]; const list=inventoryKeys();
+  const startX=W/2-420, startY=220, w=150, h=176, gx=16, gy=16;
+  list.forEach((key,i)=>{ const col=i%5,row=(i/5)|0; cards.push({key,x:startX+col*(w+gx),y:startY+row*(h+gy),w,h}); });
+  return cards;
+}
+function startCaseOpening(){
+  if(caseOpening.active) return false;
+  if(!spendTokens(1)) return false;
+  const pool = equipmentOrder.filter(k=>equipmentDefs[k] && player.level >= (equipmentDefs[k].level||1));
+  const src = pool.length ? pool : ['vest'];
+  const win = src[(Math.random()*src.length)|0];
+  caseOpening.items = [];
+  for(let i=0;i<34;i++) caseOpening.items.push(src[(Math.random()*src.length)|0]);
+  caseOpening.win = win; caseOpening.items[27] = win;
+  caseOpening.timer = 0; caseOpening.duration = 4.2; caseOpening.granted = false; caseOpening.active = true;
+  lobbyUi='opening'; gamblerBubble.text='Točí se to...'; gamblerBubble.timer=4.5;
+  return true;
+}
+function updateCaseOpening(dt){
+  if(!caseOpening.active) return;
+  caseOpening.timer += dt;
+  if(caseOpening.timer >= caseOpening.duration && !caseOpening.granted){
+    caseOpening.granted = true; caseOpening.active = false;
+    addInventoryItem(caseOpening.win,1);
+    gamblerBubble.text='Padlo ti: '+itemName(caseOpening.win); gamblerBubble.timer=4.2;
+    message='ZÍSKÁNO: '+itemName(caseOpening.win); messageTimer=1.4;
+  }
+}
+function randomStory(){
+  const lines=[
+    'Kdysi jsem šel do skladu jen s pistolí a jedním zásobníkem. Ven jsem vyšel bez pistole, ale s plánem.',
+    'V továrně jsou světla horší než nepřítel. Když zhasnou, nepanikař. Panika střílí vedle.',
+    'Jeden kadet se schoval do stínu a přežil celou misi. Druhý běžel doprostřed. Hádej, kdo vypráví.',
+    'Kamery nejsou chytré. Jen trpělivé. Počkej si na jejich otočení a pak běž.',
+    'Když slyšíš alarm, nehledej hrdinství. Hledej kryt.'
+  ];
+  return lines[(Math.random()*lines.length)|0];
+}
+function hireStoryCompanion(){
+  if(hasInventoryItem('ally_viktor')){ storyNpcBubble.text='Už mě máš v inventáři. Použij mě přes I.'; storyNpcBubble.timer=4; return true; }
+  if(!spendTokens(5)){ storyNpcBubble.text=randomStory(); storyNpcBubble.timer=6; return false; }
+  addInventoryItem('ally_viktor',1);
+  storyNpcBubble.text='Dobře. Jdu s tebou. Najdeš mě v inventáři.'; storyNpcBubble.timer=5;
+  message='PARŤÁK ZÍSKÁN'; messageTimer=1.4;
+  return true;
+}
+
+function nearestPetTarget(){
+  let best=null, bd=1e9;
+  for(const e of enemies){
+    if(!e || e.hp<=0) continue;
+    const d=dist(pet.x,pet.y,e.x,e.y);
+    if(d<bd && d<360 && los(pet.x,pet.y,e.x,e.y,6)){ bd=d; best=e; }
+  }
+  return best;
+}
+function killEnemyByPet(e){
+  if(!e || e.hp<=0) return;
+  const ang = angleTo(pet.x,pet.y,e.x,e.y);
+  e.hp = 0;
+  e.corpseDX=Math.cos(ang)*rand(25,48); e.corpseDY=Math.sin(ang)*rand(25,48); e.corpseRot=rand(-1.1,1.1); e.corpseAnim=0;
+  e.bleedTime=rand(3,6); e.bleedNext=rand(.08,.18);
+  player.kills++; player.totalKills++; player.score += e.type==='armored'?180:100;
+  grantXp(1); saveProgress(); saveAccountToSupabase();
+  addBloodDecal(e.x+rand(-12,12),e.y+rand(-12,12),rand(22,40),false,ang,e.bloodColor);
+  dropEnemyPickup(e);
+  message='MAZLÍČEK ZABIL NPC';
+  messageTimer=.7;
+}
+function updatePet(dt,simDt){
+  if(player.equippedPet!=='pet_basic' || player.dead){ pet.active=false; return; }
+  if(!pet.active){ pet.active=true; pet.x=player.x-34; pet.y=player.y+42; pet.ang=player.ang; pet.attackCd=rand(1.2,2.4); }
+  const followD = dist(pet.x,pet.y,player.x,player.y);
+  if(followD > 650){ pet.x=player.x-36; pet.y=player.y+42; }
+  const target = (gameMode==='mission') ? nearestPetTarget() : null;
+  if(target){
+    pet.ang = angleTo(pet.x,pet.y,target.x,target.y);
+    if(dist(pet.x,pet.y,target.x,target.y)>42){
+      moveCircle(pet,Math.cos(pet.ang)*230,Math.sin(pet.ang)*230,simDt);
+      pet.moving=true; pet.walk+=dt*14;
+    } else {
+      pet.moving=false;
+      pet.attackCd=Math.max(0,pet.attackCd-simDt);
+      if(pet.attackCd<=0){
+        pet.attackCd=rand(2.2,4.0);
+        if(Math.random()<.62) killEnemyByPet(target);
+        else { target.hp-=70; target.alert=2.4; if(target.hp<=0) killEnemyByPet(target); }
+      }
+    }
+  } else {
+    pet.ang = angleTo(pet.x,pet.y,player.x,player.y);
+    if(followD > 58){
+      moveCircle(pet,Math.cos(pet.ang)*210,Math.sin(pet.ang)*210,simDt);
+      pet.moving=true; pet.walk+=dt*12;
+    } else pet.moving=false;
+  }
+}
+function drawPet(){
+  if(!pet.active) return;
+  ctx.save();
+  ctx.translate(pet.x,pet.y);
+  ctx.rotate(pet.ang-Math.PI/2);
+  ctx.fillStyle='rgba(0,0,0,.35)'; ctx.beginPath(); ctx.ellipse(3,10,22,12,0,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle='#1c1c1c'; ctx.strokeStyle='#d8d8d8'; ctx.lineWidth=2;
+  ctx.beginPath(); ctx.ellipse(0,5,19,13,0,0,Math.PI*2); ctx.fill(); ctx.stroke();
+  ctx.beginPath(); ctx.arc(-5,-13,11,0,Math.PI*2); ctx.fill(); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(-14,-20); ctx.lineTo(-22,-31); ctx.lineTo(-10,-24); ctx.fill(); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(2,-20); ctx.lineTo(10,-31); ctx.lineTo(9,-21); ctx.fill(); ctx.stroke();
+  ctx.fillStyle='#d20b1c'; ctx.fillRect(-15,3,30,5);
+  ctx.restore();
+  ctx.save(); ctx.font='11px Arial Black'; ctx.textAlign='center'; ctx.fillStyle='#fff'; ctx.strokeStyle='#000'; ctx.lineWidth=3;
+  ctx.strokeText('PET',pet.x,pet.y-36); ctx.fillText('PET',pet.x,pet.y-36); ctx.restore();
+}
+
+function setupCompanion(){
+  if(player.equippedAlly==='ally_viktor' && gameMode==='mission'){
+    companion.active=true; companion.x=player.x-46; companion.y=player.y+36; companion.ang=player.ang; companion.hp=companion.maxHp=110; companion.shootCd=.5;
+  } else companion.active=false;
+}
+function nearestCompanionTarget(){
+  let best=null, bd=1e9;
+  for(const e of enemies){
+    if(!e || e.hp<=0) continue;
+    const d=dist(companion.x,companion.y,e.x,e.y);
+    if(d<bd && d<620 && los(companion.x,companion.y,e.x,e.y,6)){ bd=d; best=e; }
+  }
+  return best;
+}
+function updateCompanion(dt,simDt){
+  if(player.equippedAlly!=='ally_viktor' || gameMode!=='mission' || player.dead){ companion.active=false; return; }
+  if(!companion.active){ companion.active=true; companion.x=player.x-52; companion.y=player.y+42; companion.hp=110; companion.maxHp=110; companion.shootCd=.4; }
+  const followD = dist(companion.x,companion.y,player.x,player.y);
+  if(followD > 720){ companion.x=player.x-60; companion.y=player.y+45; }
+  const target = nearestCompanionTarget();
+  if(target){
+    companion.ang = angleTo(companion.x,companion.y,target.x,target.y);
+    if(followD > 105){ const a=angleTo(companion.x,companion.y,player.x,player.y); moveCircle(companion,Math.cos(a)*170,Math.sin(a)*170,simDt); companion.moving=true; companion.walk+=dt*10; }
+    else companion.moving=false;
+    companion.shootCd=Math.max(0,companion.shootCd-simDt);
+    if(companion.shootCd<=0){ companion.shootCd=.34; shoot('a',companion.x,companion.y,companion.ang,34,780,.08); }
+  } else {
+    companion.ang = angleTo(companion.x,companion.y,player.x,player.y);
+    if(followD > 95){ moveCircle(companion,Math.cos(companion.ang)*185,Math.sin(companion.ang)*185,simDt); companion.moving=true; companion.walk+=dt*10; }
+    else companion.moving=false;
+  }
+}
+function drawCompanion(){
+  if(!companion.active) return;
+  drawSpriteAt(companion.x,companion.y,companion.ang,companion.walk,companion.moving,'VIKTOR','brightness(.55) contrast(1.2) saturate(.55)',companion.hp,companion.maxHp,enemySprites[2],enemySpritesReady[2]);
+}
+
 function updateLobby(dt){
   const simDt = dt;
   leaderboardTimer = Math.max(0, leaderboardTimer - dt);
@@ -1289,13 +2292,36 @@ function updateLobby(dt){
   const speed = player.spd * (sprinting ? 1.45 : 1);
   player.moving = magReal > 0.05;
   if(player.moving) player.walk += dt * (sprinting ? 18 : 12);
+  stepSoundTimer = Math.max(0, stepSoundTimer - dt);
+  if(player.moving && stepSoundTimer <= 0){
+    stepSoundTimer = sprinting ? .28 : .42;
+    playFootstepSound();
+  }
+  const px0 = player.x, py0 = player.y;
   moveCircle(player, mx/mag*speed, my/mag*speed, simDt);
+  if(blockedCircle(player.x,player.y,player.r)){
+    player.x = Number.isFinite(player.safeX) ? player.safeX : px0;
+    player.y = Number.isFinite(player.safeY) ? player.safeY : py0;
+  } else {
+    player.safeX = player.x; player.safeY = player.y;
+  }
   updatePlayerRecoil(dt);
+  updatePet(dt, simDt);
+  if(blockedCircle(player.x,player.y,player.r)){
+    player.x = Number.isFinite(player.safeX) ? player.safeX : px0;
+    player.y = Number.isFinite(player.safeY) ? player.safeY : py0;
+    player.recoilVX=0; player.recoilVY=0;
+  } else {
+    player.safeX = player.x; player.safeY = player.y;
+  }
   updateShadowStealth(dt, player.moving);
-  revealFog(player.x,player.y,900);
+  revealFog(player.x,player.y,1200);
   updatePlayerWeapon(dt, simDt);
   updateLooseFx(dt, simDt);
   updateLobbyTargets(dt);
+  updateCaseOpening(dt);
+  if(gamblerBubble.timer>0) gamblerBubble.timer -= dt;
+  if(storyNpcBubble.timer>0) storyNpcBubble.timer -= dt;
   if(chatBubble.timer>0) chatBubble.timer -= dt;
   if(merchantBubble.timer>0) merchantBubble.timer -= dt;
   merchantBubble.next -= dt;
@@ -1314,12 +2340,16 @@ function updateLobby(dt){
       merchantBubble.next = rand(10,16);
     } else {
       const lines = [
-        'Kdo střílí do skříňky, platí novou.',
-        'Mám tu zbraně, co prošly aspoň jednou STK.',
-        'Kadet, nečum na mě a běž trénovat.',
-        'Jestli tě trefí kamera, nedělej že to byla dekorace.',
-        'Figurína si nestěžuje. Zatím.',
-        'Dveře jsou pomalé, ale aspoň jsou dramatické.'
+        'Kadet, ta puška není mikrofon. Nezpívej do hlavně.',
+        'Jestli se zeptáš na slevu, prodám ti krabici s nápisem tank.',
+        'Dneska mám speciální nabídku: zbraň, která občas trefí i to, na co míříš.',
+        'Nesahej na červený tlačítka. Nebo sahej. Já pak prodám víc munice.',
+        'Figurína má víc disciplíny než půlka týmu.',
+        'Kdyby se něco rozbilo, nebyl jsem tady. Kdyby něco vyhrálo, byl to můj plán.',
+        'Mám i tichý boty. Nejsou tichý, jenom se za ně stydíš.',
+        'Kamera tě neviděla. Jen si tě uložila jako tapetu.',
+        'Voják bez munice je jen nervózní turista.',
+        'Tahle lobby smrdí potem, olovem a špatným rozhodnutím.'
       ];
       merchantBubble.text = lines[(Math.random()*lines.length)|0];
       merchantBubble.timer = 3.4;
@@ -1334,6 +2364,12 @@ function updateLobby(dt){
   const nearShop = dist(player.x,player.y,lobbyData.shopkeeper.x,lobbyData.shopkeeper.y) < 95;
   const nearMission = nearRect(player.x,player.y,42,lobbyData.missionDesk);
   const nearLoadout = nearRect(player.x,player.y,42,lobbyData.loadout);
+  const nearSkills = nearRect(player.x,player.y,48,lobbyData.skills);
+  const nearArena = lobbyData.arena && nearRect(player.x,player.y,42,lobbyData.arena);
+  const nearTrainer = lobbyData.trainer && dist(player.x,player.y,lobbyData.trainer.x,lobbyData.trainer.y) < 95;
+  const nearEvent = lobbyData.eventNpc && dist(player.x,player.y,lobbyData.eventNpc.x,lobbyData.eventNpc.y) < 95;
+  const nearGambler = lobbyData.gambler && dist(player.x,player.y,lobbyData.gambler.x,lobbyData.gambler.y) < 92;
+  const nearStoryNpc = lobbyData.storyNpc && dist(player.x,player.y,lobbyData.storyNpc.x,lobbyData.storyNpc.y) < 92;
   if(!keys.e) lobbyELock = false;
   if(keys.e && !lobbyELock){
     lobbyELock = true;
@@ -1347,6 +2383,12 @@ function updateLobby(dt){
     } else if(nearShop) lobbyUi = lobbyUi === 'shop' ? null : 'shop';
     else if(nearMission) lobbyUi = lobbyUi === 'missions' ? null : 'missions';
     else if(nearLoadout) lobbyUi = lobbyUi === 'loadout' ? null : 'loadout';
+    else if(nearSkills) lobbyUi = lobbyUi === 'skills' ? null : 'skills';
+    else if(nearArena){ arenaConfirmStep = 1; lobbyUi = 'arena'; }
+    else if(nearTrainer) lobbyUi = lobbyUi === 'pets' ? null : 'pets';
+    else if(nearEvent) lobbyUi = lobbyUi === 'events' ? null : 'events';
+    else if(nearGambler) startCaseOpening();
+    else if(nearStoryNpc) hireStoryCompanion();
   }
 
   camera.x = clamp(player.x - W/2, 0, Math.max(0,map.w-W));
@@ -1381,6 +2423,43 @@ function drawSpriteAt(x,y,ang,walk,moving,name,filter='brightness(.75) contrast(
   }
   ctx.restore();
 }
+function drawGambler(){
+  const g=lobbyData.gambler; if(!g) return;
+  ctx.save(); ctx.translate(g.x,g.y); ctx.rotate(g.ang-Math.PI/2);
+  const img=enemySprites[4]||enemySprites[0];
+  if(enemySpritesReady[4] && img){ ctx.filter='brightness(.75) contrast(1.2)'; ctx.drawImage(img,-58,-58,116,116); ctx.filter='none'; }
+  else { ctx.fillStyle='#555'; ctx.beginPath(); ctx.ellipse(0,0,18,25,0,0,Math.PI*2); ctx.fill(); }
+  ctx.restore();
+  ctx.save(); ctx.font='13px Impact'; ctx.textAlign='center'; ctx.fillStyle='#ffe07a'; ctx.strokeStyle='#000'; ctx.lineWidth=3;
+  ctx.strokeText('HAZARD',g.x,g.y-50); ctx.fillText('HAZARD',g.x,g.y-50); ctx.restore();
+  if(gamblerBubble.timer>0) drawWorldBubble(g.x,g.y-58,gamblerBubble.text,{maxChars:30,stroke:'#ffe07a',bg:'rgba(22,16,0,.88)',color:'#fff1aa'});
+}
+function drawPrisonNpc(){
+  const list = lobbyData.prisonNpcs || (lobbyData.prisonNpc ? [lobbyData.prisonNpc] : []);
+  if(!list.length) return;
+  for(const n of list){
+    if(!n) continue;
+    ctx.save();
+    ctx.translate(n.x,n.y);
+    ctx.rotate(n.ang-Math.PI/2);
+    const img=enemySprites[1]||enemySprites[0];
+    if(enemySpritesReady[1] && img){ ctx.filter='brightness(.55) contrast(1.15) saturate(.55)'; ctx.drawImage(img,-56,-56,112,112); ctx.filter='none'; }
+    else { ctx.fillStyle='#333'; ctx.beginPath(); ctx.ellipse(0,0,18,25,0,0,Math.PI*2); ctx.fill(); }
+    ctx.restore();
+  }
+}
+function drawStoryNpc(){
+  const n=lobbyData.storyNpc; if(!n) return;
+  ctx.save(); ctx.translate(n.x,n.y); ctx.rotate(n.ang-Math.PI/2);
+  const img=enemySprites[5]||enemySprites[2]||enemySprites[0];
+  if(enemySpritesReady[5] && img){ ctx.filter='brightness(.68) contrast(1.12) saturate(.7)'; ctx.drawImage(img,-60,-60,120,120); ctx.filter='none'; }
+  else { ctx.fillStyle='#666'; ctx.beginPath(); ctx.ellipse(0,0,18,25,0,0,Math.PI*2); ctx.fill(); }
+  ctx.restore();
+  ctx.save(); ctx.font='13px Impact'; ctx.textAlign='center'; ctx.fillStyle='#cfe7ff'; ctx.strokeStyle='#000'; ctx.lineWidth=3;
+  ctx.strokeText('VIKTOR',n.x,n.y-50); ctx.fillText('VIKTOR',n.x,n.y-50); ctx.restore();
+  if(storyNpcBubble.timer>0) drawWorldBubble(n.x,n.y-58,storyNpcBubble.text,{maxChars:34,stroke:'#6bb7ff',bg:'rgba(0,10,22,.88)',color:'#d9f0ff'});
+}
+
 function drawShopkeeper(){
   const s = lobbyData.shopkeeper;
   ctx.save();
@@ -1439,8 +2518,36 @@ function drawLobbyTargets(){
     drawEnemy(t);
   }
 }
+function drawTrainer(){
+  const n = lobbyData.trainer;
+  if(!n) return;
+  drawSpriteAt(n.x,n.y,n.ang||Math.PI,0,false,'TRENÉR','brightness(.55) contrast(1.18) saturate(.75)',100,100,enemySprites[2],enemySpritesReady[2]);
+}
+function drawEventNpc(){
+  const n = lobbyData.eventNpc;
+  if(!n) return;
+  drawSpriteAt(n.x,n.y,n.ang||Math.PI,0,false,'EVENTY','brightness(.62) contrast(1.25) saturate(.9)',100,100,enemySprites[3]||enemySprites[1],enemySpritesReady[3]||enemySpritesReady[1]);
+  ctx.save();
+  ctx.font='26px Impact';
+  ctx.textAlign='center';
+  ctx.fillStyle='#ffe07a';
+  ctx.strokeStyle='#000';
+  ctx.lineWidth=6;
+  ctx.strokeText('EVENTY',n.x,n.y-72);
+  ctx.fillText('EVENTY',n.x,n.y-72);
+  ctx.font='15px Arial Black';
+  ctx.fillStyle='#fff';
+  ctx.strokeText('CHAOS',n.x,n.y-50);
+  ctx.fillText('CHAOS',n.x,n.y-50);
+  ctx.restore();
+}
 function drawLobbyCharacters(){
   drawShopkeeper();
+  drawGambler();
+  drawStoryNpc();
+  drawPrisonNpc();
+  drawTrainer();
+  drawEventNpc();
   drawLobbyTargets();
   if(online.active){
     drawOnlinePlayers();
@@ -1471,8 +2578,14 @@ function drawLobbyPrompts(){
   const nearShop = dist(player.x,player.y,lobbyData.shopkeeper.x,lobbyData.shopkeeper.y) < 95;
   const nearMission = nearRect(player.x,player.y,42,lobbyData.missionDesk);
   const nearLoadout = nearRect(player.x,player.y,42,lobbyData.loadout);
-  if(nearShop || nearMission || nearLoadout){
-    const txt = nearShop ? 'E  OBCHODOVAT' : (nearMission ? 'E  VYBRAT MISI' : 'E  VYBAVENÍ');
+  const nearSkills = nearRect(player.x,player.y,48,lobbyData.skills);
+  const nearArena = lobbyData.arena && nearRect(player.x,player.y,42,lobbyData.arena);
+  const nearTrainer = lobbyData.trainer && dist(player.x,player.y,lobbyData.trainer.x,lobbyData.trainer.y) < 95;
+  const nearEvent = lobbyData.eventNpc && dist(player.x,player.y,lobbyData.eventNpc.x,lobbyData.eventNpc.y) < 95;
+  const nearGambler = lobbyData.gambler && dist(player.x,player.y,lobbyData.gambler.x,lobbyData.gambler.y) < 92;
+  const nearStoryNpc = lobbyData.storyNpc && dist(player.x,player.y,lobbyData.storyNpc.x,lobbyData.storyNpc.y) < 92;
+  if(nearShop || nearMission || nearLoadout || nearSkills || nearArena || nearTrainer || nearEvent || nearGambler || nearStoryNpc){
+    const txt = nearShop ? 'E  OBCHOD' : nearMission ? 'E  VYBRAT MISI' : nearLoadout ? 'E  VYBAVENÍ' : nearSkills ? 'E  SKILLY' : nearArena ? 'E  ARENA' : nearTrainer ? 'E  TRENÉR' : nearEvent ? 'E  EVENTY' : nearGambler ? 'E  OPENING  1 TOKEN' : 'E  PŘÍBĚH / 5 TOKENŮ PARŤÁK';
     ctx.font='28px Impact'; ctx.textAlign='center'; ctx.strokeStyle='#000'; ctx.lineWidth=6; ctx.fillStyle='#fff';
     ctx.strokeText(txt,W/2,H-105); ctx.fillText(txt,W/2,H-105);
   }
@@ -1536,7 +2649,7 @@ function startFirstStory(){
   buildLobbyMap();
   initLobbyTargets();
   enemies = []; turrets = []; cameras = []; bullets = []; grenades = []; explosions = []; craters = []; particles = []; pickups = []; shells = []; bulletMarks = []; bloodDecals = [];
-  player.x=210; player.y=540; player.ang=0; player.hp=player.maxHp;
+  player.x=210; player.y=540; player.safeX=player.x; player.safeY=player.y; player.ang=0; player.hp=player.maxHp;
   applyLoadout(player.weaponType, false, true);
   player.dead=false; player.reload=0; player.shootCd=0; player.muzzleFx=0; player.moving=false;
   resetFog();
@@ -1718,8 +2831,11 @@ function getLoadoutCardRects(){
 }
 function getEquipmentCardRects(){
   const cards=[];
-  const startX=W/2-392, startY=258, cardW=148, cardH=214, gap=11;
-  equipmentOrder.forEach((key,i)=>cards.push({key,x:startX+i*(cardW+gap),y:startY,w:cardW,h:cardH}));
+  const startX=W/2-410, startY=225, cardW=190, cardH=170, gapX=18, gapY=20;
+  equipmentOrder.forEach((key,i)=>{
+    const col=i%4, row=(i/4)|0;
+    cards.push({key,x:startX+col*(cardW+gapX),y:startY+row*(cardH+gapY),w:cardW,h:cardH});
+  });
   return cards;
 }
 function drawItemIcon(key,x,y,w,h){
@@ -1730,6 +2846,13 @@ function drawItemIcon(key,x,y,w,h){
     ctx.fillStyle='#111'; ctx.fillRect(-9,-22,18,14); ctx.strokeRect(-9,-22,18,14);
     ctx.strokeStyle='#bbb'; ctx.lineWidth=3; ctx.beginPath(); ctx.arc(13,-18,9,-1.4,1.4); ctx.stroke();
     ctx.fillStyle='#d20b1c'; ctx.fillRect(-16,-5,32,7);
+  } else if(key==='pet_basic'){
+    ctx.fillStyle='#1d1d1d'; ctx.strokeStyle='#e0e0e0'; ctx.lineWidth=3;
+    ctx.beginPath(); ctx.ellipse(0,8,28,20,0,0,Math.PI*2); ctx.fill(); ctx.stroke();
+    ctx.beginPath(); ctx.arc(-10,-14,15,0,Math.PI*2); ctx.fill(); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(-21,-25); ctx.lineTo(-30,-38); ctx.lineTo(-18,-30); ctx.fill(); ctx.stroke();
+    ctx.beginPath(); ctx.moveTo(2,-25); ctx.lineTo(10,-38); ctx.lineTo(9,-27); ctx.fill(); ctx.stroke();
+    ctx.fillStyle='#d20b1c'; ctx.fillRect(-20,8,40,7);
   } else if(equipmentDefs[key]){
     const c1='#3a3a3a', c2='#101010'; ctx.strokeStyle='#cfcfcf'; ctx.lineWidth=2; ctx.fillStyle=c1;
     if(key==='vest'){
@@ -1792,17 +2915,113 @@ function drawLoadoutCard(card, selected){
 function drawEquipmentCard(card){
   const d=equipmentDefs[card.key];
   const selected=!!player.equippedGear[card.key];
+  const owned=hasInventoryItem(card.key);
+  const locked=player.level < (d.level||1);
   ctx.save();
-  ctx.fillStyle=selected?'rgba(115,75,15,.96)':'rgba(18,18,18,.96)';
-  ctx.strokeStyle=selected?'#ffe07a':'#5c5c5c'; ctx.lineWidth=selected?4:2;
+  ctx.fillStyle=selected?'rgba(115,75,15,.96)':owned?'rgba(25,45,25,.96)':locked?'rgba(20,20,20,.92)':'rgba(18,18,18,.96)';
+  ctx.strokeStyle=selected?'#ffe07a':owned?'#5bd15b':locked?'#444':'#5c5c5c'; ctx.lineWidth=selected?4:2;
   ctx.fillRect(card.x,card.y,card.w,card.h); ctx.strokeRect(card.x,card.y,card.w,card.h);
-  ctx.fillStyle='#0a0a0a'; ctx.fillRect(card.x+8,card.y+8,card.w-16,108);
-  drawItemIcon(card.key,card.x+18,card.y+14,card.w-36,96);
-  ctx.textAlign='left'; ctx.fillStyle='#fff'; ctx.font='18px Impact'; ctx.fillText(d.name,card.x+12,card.y+136);
-  ctx.font='13px Arial Black'; ctx.fillStyle='#d6d6d6'; ctx.fillText(d.slot,card.x+12,card.y+156);
-  ctx.font='12px Arial'; ctx.fillText(d.desc,card.x+12,card.y+176);
-  ctx.font='11px Arial Black'; ctx.fillStyle=selected?'#ffe07a':'#9f9f9f'; ctx.fillText(selected?'NASAZENO':'KLIKNOUT NASADIT',card.x+12,card.y+206);
+  ctx.fillStyle='#0a0a0a'; ctx.fillRect(card.x+8,card.y+8,card.w-16,78);
+  if(d.imgPath && d.ready && d.img) ctx.drawImage(d.img,card.x+12,card.y+6,card.w-24,82);
+  else drawItemIcon(card.key,card.x+22,card.y+12,card.w-44,70);
+  ctx.textAlign='left'; ctx.fillStyle='#fff'; ctx.font='17px Impact'; ctx.fillText(d.name,card.x+12,card.y+105);
+  ctx.font='11px Arial Black'; ctx.fillStyle='#d6d6d6'; ctx.fillText(d.slot,card.x+12,card.y+122);
+  const bonus=[];
+  if(d.hp) bonus.push('HP +' + d.hp);
+  if(d.armor) bonus.push('DEF +' + Math.round(d.armor*100) + '%');
+  if(d.str) bonus.push('SÍLA +' + Math.round(d.str*100) + '%');
+  if(card.key==='laser') bonus.push(player.laserOn===false?'LASER OFF':'LASER ON');
+  ctx.font='10px Arial Black'; ctx.fillStyle='#ffe07a'; ctx.fillText(bonus.join('  ') || 'DOPLNĚK',card.x+12,card.y+139);
+  ctx.font='10px Arial Black'; ctx.fillStyle=locked?'#ff5c5c':selected?'#ffe07a':owned?'#73ff73':'#9f9f9f';
+  ctx.fillText(locked?('LEVEL '+(d.level||1)):selected?'NASAZENO':owned?'V INVENTÁŘI':'KOUPIT ZDARMA',card.x+12,card.y+158);
   ctx.restore();
+}
+
+function getSkillButtonRects(){
+  const x=W/2-390, y=230, rowH=76;
+  return [
+    {key:'hp',x:x+690,y:y+0*rowH,w:150,h:48},
+    {key:'str',x:x+690,y:y+1*rowH,w:150,h:48},
+    {key:'speed',x:x+690,y:y+2*rowH,w:150,h:48},
+    {key:'def',x:x+690,y:y+3*rowH,w:150,h:48}
+  ];
+}
+function drawSkillRow(key,label,desc,y){
+  const s=player.skills||{};
+  const value = s[key]|0;
+  const x=W/2-390;
+  ctx.textAlign='left';
+  ctx.font='28px Impact'; ctx.fillStyle='#fff';
+  ctx.fillText(label,x,y+34);
+  ctx.font='16px Arial Black'; ctx.fillStyle='rgba(255,255,255,.72)';
+  ctx.fillText(desc,x+165,y+31);
+  ctx.fillStyle='rgba(255,255,255,.12)'; ctx.fillRect(x+455,y+13,190,24);
+  ctx.fillStyle='#d20b1c'; ctx.fillRect(x+455,y+13,Math.min(190,value*12),24);
+  ctx.strokeStyle='rgba(255,255,255,.55)'; ctx.lineWidth=1; ctx.strokeRect(x+455,y+13,190,24);
+  ctx.font='22px Impact'; ctx.fillStyle='#ffe07a'; ctx.textAlign='center';
+  ctx.fillText(String(value),x+665,y+34);
+}
+function drawSkillWindow(){
+  const avail = availableSkillPoints();
+  ctx.strokeText('SKILLY / UPGRADE',W/2,112); ctx.fillText('SKILLY / UPGRADE',W/2,112);
+  ctx.font='20px Impact'; ctx.textAlign='center'; ctx.fillStyle='#ffe07a'; ctx.strokeStyle='#000'; ctx.lineWidth=4;
+  ctx.strokeText('1 TOKEN = 1 BOD   TOKENY: '+availableTokens(),W/2,150);
+  ctx.fillText('1 TOKEN = 1 BOD   TOKENY: '+availableTokens(),W/2,150);
+  drawSkillRow('hp','HP','+10 max HP za bod',230);
+  drawSkillRow('str','SÍLA','+5 % damage za bod',306);
+  drawSkillRow('speed','RYCHLOST','+7 rychlost za bod',382);
+  drawSkillRow('def','OBRANA','-2.5 % damage za bod',458);
+  for(const b of getSkillButtonRects()){
+    drawButton(b.x,b.y,b.w,b.h,avail>0?'+ UPGRADE':'BEZ BODŮ',avail>0);
+  }
+}
+
+function drawInventoryCard(card){
+  const key=card.key, d=equipmentDefs[key], isAlly=key==='ally_viktor';
+  const equipped = isAlly ? player.equippedAlly===key : !!(d && player.equippedGear && player.equippedGear[key]);
+  ctx.save();
+  ctx.fillStyle=equipped?'rgba(115,75,15,.96)':'rgba(18,18,18,.96)';
+  ctx.strokeStyle=equipped?'#ffe07a':'#6c6c6c'; ctx.lineWidth=equipped?4:2;
+  ctx.fillRect(card.x,card.y,card.w,card.h); ctx.strokeRect(card.x,card.y,card.w,card.h);
+  ctx.fillStyle='#0a0a0a'; ctx.fillRect(card.x+8,card.y+8,card.w-16,72);
+  if(d && d.imgPath && d.ready && d.img) ctx.drawImage(d.img,card.x+10,card.y+6,card.w-20,76);
+  else if(isAlly) drawSpriteAt(card.x+card.w/2,card.y+48,0,0,false,'','brightness(.55) contrast(1.2)',null,60,enemySprites[2],enemySpritesReady[2]);
+  else drawItemIcon(key,card.x+18,card.y+12,card.w-36,66);
+  ctx.textAlign='left'; ctx.font='15px Impact'; ctx.fillStyle='#fff'; ctx.fillText(itemName(key),card.x+10,card.y+98);
+  ctx.font='10px Arial Black'; ctx.fillStyle=equipped?'#ffe07a':'#aaa'; ctx.fillText(equipped?'POUŽITO':'LEVÝ KLIK POUŽÍT',card.x+10,card.y+116);
+  ctx.fillStyle='rgba(255,255,255,.55)'; ctx.fillText('PRAVÝ KLIK DEMONT',card.x+10,card.y+132);
+  ctx.fillStyle='rgba(210,11,28,.95)'; ctx.fillRect(card.x+8,card.y+card.h-24,card.w-16,18);
+  ctx.font='10px Arial Black'; ctx.fillStyle='#fff'; ctx.textAlign='center';
+  ctx.fillText('VYHODIT',card.x+card.w/2,card.y+card.h-11);
+  ctx.restore();
+}
+function drawInventoryWindow(){
+  ctx.strokeText('INVENTÁŘ',W/2,170); ctx.fillText('INVENTÁŘ',W/2,170);
+  ctx.font='14px Arial Black'; ctx.textAlign='center'; ctx.fillStyle='rgba(255,255,255,.66)';
+  ctx.fillText('Jen v lobby. Levý klik použít, pravý klik demontovat, VYHODIT smaže item.',W/2,202);
+  const cards=getInventoryCardRects();
+  if(!cards.length){ ctx.font='26px Impact'; ctx.fillStyle='rgba(255,255,255,.45)'; ctx.fillText('INVENTÁŘ JE PRÁZDNÝ',W/2,340); }
+  else cards.forEach(drawInventoryCard);
+}
+function drawOpeningWindow(){
+  ctx.strokeText('OPENING',W/2,170); ctx.fillText('OPENING',W/2,170);
+  const p=clamp(caseOpening.timer/caseOpening.duration,0,1);
+  const centerX=W/2, y=300, cardW=118, gap=16, stopIndex=27;
+  const offset=(stopIndex*(cardW+gap))*(1-Math.pow(1-p,3));
+  ctx.save(); ctx.beginPath(); ctx.rect(W/2-390,235,780,160); ctx.clip();
+  for(let i=0;i<caseOpening.items.length;i++){
+    const key=caseOpening.items[i], x=centerX-offset+i*(cardW+gap), d=equipmentDefs[key];
+    ctx.fillStyle='rgba(18,18,18,.96)'; ctx.strokeStyle=key===caseOpening.win && !caseOpening.active?'#ffe07a':'#777'; ctx.lineWidth=3;
+    ctx.fillRect(x,y-56,cardW,128); ctx.strokeRect(x,y-56,cardW,128);
+    ctx.fillStyle='#050505'; ctx.fillRect(x+8,y-48,cardW-16,72);
+    if(d && d.imgPath && d.ready && d.img) ctx.drawImage(d.img,x+10,y-50,cardW-20,76);
+    else drawItemIcon(key,x+16,y-42,cardW-32,60);
+    ctx.font='13px Impact'; ctx.textAlign='center'; ctx.fillStyle='#fff'; ctx.fillText(itemName(key),x+cardW/2,y+54);
+  }
+  ctx.restore();
+  ctx.strokeStyle='#d20b1c'; ctx.lineWidth=5; ctx.beginPath(); ctx.moveTo(W/2,230); ctx.lineTo(W/2,404); ctx.stroke();
+  ctx.font='18px Arial Black'; ctx.fillStyle='#ffe07a'; ctx.textAlign='center';
+  ctx.fillText(caseOpening.active?'TOČÍ SE...':'VYHRÁL JSI: '+itemName(caseOpening.win),W/2,438);
 }
 
 function drawLobbyWindows(){
@@ -1811,7 +3030,9 @@ function drawLobbyWindows(){
   ctx.fillStyle='rgba(0,0,0,.72)';
   ctx.fillRect(0,0,W,H);
   let ww = 560, wh = 360, wx = W/2-280, wy = 150;
-  if(lobbyUi==='loadout' || lobbyUi==='shop'){ ww = 820; wh = 430; wx = W/2-410; wy = 110; }
+  if(lobbyUi==='missions'){ ww = 820; wh = 410; wx = W/2-410; wy = 110; }
+  if(lobbyUi==='arena' || lobbyUi==='daily' || lobbyUi==='pets' || lobbyUi==='events'){ ww = 700; wh = 380; wx = W/2-350; wy = 145; }
+  if(lobbyUi==='loadout' || lobbyUi==='shop' || lobbyUi==='skills' || lobbyUi==='inventory' || lobbyUi==='opening'){ ww = 980; wh = 620; wx = W/2-490; wy = 48; }
   ctx.fillStyle='rgba(8,8,8,.96)';
   ctx.strokeStyle='#d20b1c';
   ctx.lineWidth=4;
@@ -1819,18 +3040,59 @@ function drawLobbyWindows(){
   ctx.strokeRect(wx,wy,ww,wh);
   ctx.font='42px Impact'; ctx.textAlign='center'; ctx.fillStyle='#fff'; ctx.strokeStyle='#000'; ctx.lineWidth=5;
   if(lobbyUi==='shop'){
-    ctx.strokeText('OBCHOD - POSTAVY',W/2,170); ctx.fillText('OBCHOD - POSTAVY',W/2,170);
+    ctx.strokeText('OBCHOD',W/2,112); ctx.fillText('OBCHOD',W/2,112);
     const chars = getCharacterStripRects();
     chars.forEach(card => drawCharacterStrip(card));
   } else if(lobbyUi==='missions'){
-    ctx.strokeText('VÝBĚR MISE',W/2,215); ctx.fillText('VÝBĚR MISE',W/2,215);
+    ctx.strokeText('VÝBĚR MISE',W/2,154); ctx.fillText('VÝBĚR MISE',W/2,154);
     const canStart = !online.active || online.isHost;
-    const pct = (player.missionProgress && player.missionProgress[missionId]) ? player.missionProgress[missionId] : 0;
-    drawButton(W/2-205,280,410,64,canStart ? (missionName + '  ' + pct + '%') : 'ČEKÁM NA HOSTA',canStart);
+    const pct = getMissionProgress('cerny_sklad');
+    const pctVlak = getMissionProgress('vlak');
+    const pctVytah = getMissionProgress('vytah');
+    drawButton(W/2-260,210,520,60,(selectedMissionKey==='cerny_sklad'?'▶ ':'') + 'ČERNÝ SKLAD  ' + pct + '%',canStart);
+    drawButton(W/2-260,290,520,60,(selectedMissionKey==='vlak'?'▶ ':'') + 'NEKONEČNÝ PŘÍBĚH  ' + pctVlak + '%',canStart);
+    drawButton(W/2-260,370,520,60,(selectedMissionKey==='vytah'?'▶ ':'') + 'STÍNY PATRA  ' + pctVytah + '%',canStart);
+  } else if(lobbyUi==='arena'){
+    ctx.strokeText('ARENA',W/2,154); ctx.fillText('ARENA',W/2,154);
+    ctx.font='28px Impact'; ctx.fillStyle='#d8d8d8'; ctx.strokeStyle='#000'; ctx.lineWidth=4;
+    const q = arenaConfirmStep===1 ? 'CHCEŠ VSTOUPIT?' : 'OPRAVDU VSTOUPIT DO ARENY?';
+    ctx.strokeText(q,W/2,246); ctx.fillText(q,W/2,246);
+    drawButton(W/2-170,300,140,54,'ANO',true);
+    drawButton(W/2+30,300,140,54,'NE',true);
+  } else if(lobbyUi==='daily'){
+    ctx.strokeText('DENNÍ ODMĚNY',W/2,154); ctx.fillText('DENNÍ ODMĚNY',W/2,154);
+    ctx.font='28px Impact'; ctx.fillStyle='#ffe07a'; ctx.strokeStyle='#000'; ctx.lineWidth=4;
+    ctx.strokeText('+1 TOKEN',W/2,246); ctx.fillText('+1 TOKEN',W/2,246);
+    drawButton(W/2-110,310,220,58,'VYBRAT',true);
+  } else if(lobbyUi==='pets'){
+    ctx.strokeText('MAZLÍČKOVÉ',W/2,154); ctx.fillText('MAZLÍČKOVÉ',W/2,154);
+    ctx.font='19px Arial Black'; ctx.fillStyle='rgba(255,255,255,.72)'; ctx.strokeStyle='#000'; ctx.lineWidth=4;
+    ctx.strokeText('MAX 1 AKTIVNÍ PET. POUŽIJ HO V INVENTÁŘI.',W/2,210);
+    ctx.fillText('MAX 1 AKTIVNÍ PET. POUŽIJ HO V INVENTÁŘI.',W/2,210);
+    ctx.font='26px Impact'; ctx.fillStyle='#fff';
+    const petTxt = hasInventoryItem('pet_basic') ? 'MAZLÍČEK JE V INVENTÁŘI' : 'ZÁKLADNÍ MAZLÍČEK - 1 TOKEN';
+    ctx.strokeText(petTxt,W/2,270);
+    ctx.fillText(petTxt,W/2,270);
+    drawButton(W/2-130,310,260,58,hasInventoryItem('pet_basic')?'MÁŠ':'KOUPIT',!hasInventoryItem('pet_basic'));
+  } else if(lobbyUi==='events'){
+    const ev = chaosEventInfo();
+    ctx.strokeText('EVENTY',W/2,154); ctx.fillText('EVENTY',W/2,154);
+    ctx.font='26px Impact'; ctx.fillStyle='#ffe07a'; ctx.strokeStyle='#000'; ctx.lineWidth=5;
+    ctx.strokeText('CHAOS',W/2,220); ctx.fillText('CHAOS',W/2,220);
+    ctx.font='18px Arial Black'; ctx.fillStyle='#fff';
+    const et = ev.active ? ('KONČÍ ZA '+formatCountdown(ev.remaining)) : ('ZNOVU ZA '+formatCountdown(ev.remaining));
+    ctx.strokeText(et,W/2,258); ctx.fillText(et,W/2,258);
+    drawButton(W/2-170,330,340,56,ev.active?'SPUSTIT CHAOS':'NEAKTIVNÍ',ev.active);
+  } else if(lobbyUi==='skills'){
+    drawSkillWindow();
+  } else if(lobbyUi==='inventory'){
+    drawInventoryWindow();
+  } else if(lobbyUi==='opening'){
+    drawOpeningWindow();
   } else if(lobbyUi==='loadout'){
-    ctx.strokeText('VYBAVENÍ',W/2,170); ctx.fillText('VYBAVENÍ',W/2,170);
-    drawButton(W/2-205,190,190,42,'ZBRANĚ',loadoutCategory==='weapons');
-    drawButton(W/2+15,190,190,42,'VYBAVENÍ',loadoutCategory==='gear');
+    ctx.strokeText('VYBAVENÍ   TOKENY: '+availableTokens(),W/2,112); ctx.fillText('VYBAVENÍ   TOKENY: '+availableTokens(),W/2,112);
+    drawButton(W/2-205,145,190,42,'ZBRANĚ',loadoutCategory==='weapons');
+    drawButton(W/2+15,145,190,42,'VYBAVENÍ',loadoutCategory==='gear');
     if(loadoutCategory==='weapons'){
       const cards = getLoadoutCardRects();
       cards.forEach(card => drawLoadoutCard(card, player.loadoutSlots.includes(card.key)));
@@ -1840,20 +3102,29 @@ function drawLobbyWindows(){
     }
   }
   ctx.font='18px Impact'; ctx.fillStyle='#d8d8d8';
-  if(lobbyUi==='loadout' || lobbyUi==='shop'){
-    drawButton(W/2-90,545,180,48,'ZAVŘÍT',true);
-  } else {
+  if(lobbyUi==='loadout' || lobbyUi==='shop' || lobbyUi==='skills' || lobbyUi==='inventory' || lobbyUi==='opening'){
+    drawButton(W/2-90,648,180,48,'ZAVŘÍT',true);
+  } else if(lobbyUi==='arena'){
+    drawButton(W/2-90,390,180,48,'ZAVŘÍT',true);
+  } else if(lobbyUi==='daily'){
+    // denní odměna má jen tlačítko VYBRAT
+  } else if(lobbyUi==='pets'){
     drawButton(W/2-90,430,180,48,'ZAVŘÍT',true);
+  } else if(lobbyUi==='events'){
+    drawButton(W/2-90,470,180,48,'ZAVŘÍT',true);
+  } else {
+    drawButton(W/2-90,lobbyUi==='missions'?455:430,180,48,'ZAVŘÍT',true);
   }
   ctx.restore();
 }
 const player = {
   x:180,y:590,r:20,ang:0,spd:235,hp:60,maxHp:60,
   ammo:30,clip:30,reserve:90,reload:0,shootCd:0,bt:100,maxBt:100,
-  score:0,kills:0,totalKills:0,totalXp:0,level:1,levelXp:0,nextLevelXp:20,missionProgress:{cerny_sklad:0},
+  score:0,kills:0,totalKills:0,totalXp:0,level:1,levelXp:0,nextLevelXp:20,skillPoints:0,skills:{hp:0,str:0,speed:0,def:0},missionProgress:{cerny_sklad:0,vlak:0,vytah:0,arena:0,chaos:0},
   dead:false,pickupText:'',muzzleFx:0,walk:0,moving:false,weaponType:'m4',characterKey:'zlaty',reloadMax:0,
-  loadoutSlots:['m4',null],selectedSlot:0,weaponState:{},slotTroll:[false,false],trollSniper:false,
-  equippedGear:{},gearHpBonus:0,armorProtection:0,
+  loadoutSlots:['m4',null],selectedSlot:0,weaponState:{},slotTroll:[false,false],trollSniper:false,tokensSpent:0,bonusTokens:0,dailyRewardAt:0,
+  equippedGear:{},gearHpBonus:0,gearStrBonus:0,armorProtection:0,laserOn:true,
+  inventoryItems:{},equippedAlly:null,equippedPet:null,tokensSpent:0,
   recoilVX:0,recoilVY:0,shadowTime:0,hiddenInShadow:false,
   bleedTime:0,bleedNext:0,blood:[]
 };
@@ -1870,8 +3141,16 @@ function saveProgress(){
       weaponState: player.weaponState || {},
       slotTroll: player.slotTroll || [false,false],
       equippedGear: player.equippedGear || {},
+      skills: player.skills || {hp:0,str:0,speed:0,def:0},
+      laserOn: player.laserOn !== false,
+      inventoryItems: player.inventoryItems || {},
+      equippedAlly: player.equippedAlly || null,
+      equippedPet: player.equippedPet || null,
+      tokensSpent: player.tokensSpent|0,
+      bonusTokens: player.bonusTokens|0,
+      dailyRewardAt: player.dailyRewardAt|0,
       characterKey: player.characterKey || 'zlaty',
-      missionProgress: player.missionProgress || {cerny_sklad:0},
+      missionProgress: player.missionProgress || {cerny_sklad:0,vlak:0,vytah:0,arena:0,chaos:0},
       nick: getPlayerNick()
     }));
   }catch(e){}
@@ -1888,12 +3167,27 @@ function loadProgress(){
     if(data.weaponState && typeof data.weaponState === 'object') player.weaponState = data.weaponState;
     if(Array.isArray(data.slotTroll)) player.slotTroll = [!!data.slotTroll[0], !!data.slotTroll[1]];
     if(data.equippedGear && typeof data.equippedGear === 'object') player.equippedGear = {...data.equippedGear};
+    if(data.skills && typeof data.skills === 'object'){
+      player.skills = {
+        hp:Math.max(0,data.skills.hp|0),
+        str:Math.max(0,data.skills.str|0),
+        speed:Math.max(0,data.skills.speed|0),
+        def:Math.max(0,data.skills.def|0)
+      };
+    }
+    if(typeof data.laserOn === 'boolean') player.laserOn = data.laserOn;
+    if(data.inventoryItems && typeof data.inventoryItems === 'object') player.inventoryItems = {...data.inventoryItems};
+    if(data.equippedAlly) player.equippedAlly = data.equippedAlly;
+    if(data.equippedPet) player.equippedPet = data.equippedPet;
+    if(Number.isFinite(data.tokensSpent)) player.tokensSpent = Math.max(0,data.tokensSpent|0);
+    if(Number.isFinite(data.bonusTokens)) player.bonusTokens = Math.max(0,data.bonusTokens|0);
+    if(Number.isFinite(data.dailyRewardAt)) player.dailyRewardAt = Math.max(0,data.dailyRewardAt|0);
     if(data.weaponType && weaponDefs[data.weaponType]) player.weaponType = data.weaponType;
     if(!player.loadoutSlots[player.selectedSlot]) player.loadoutSlots[player.selectedSlot] = player.weaponType || 'm4';
     if(player.loadoutSlots[player.selectedSlot] && weaponDefs[player.loadoutSlots[player.selectedSlot]]) player.weaponType = player.loadoutSlots[player.selectedSlot];
     player.trollSniper = !!player.slotTroll[player.selectedSlot];
     if(data.characterKey && characterDefs[data.characterKey]) player.characterKey = data.characterKey;
-    if(data.missionProgress && typeof data.missionProgress === 'object') player.missionProgress = {...player.missionProgress, ...data.missionProgress};
+    if(data.missionProgress && typeof data.missionProgress === 'object') player.missionProgress = {...player.missionProgress, ...data.missionProgress, chaos:(data.missionProgress.chaos|0)||player.missionProgress.chaos||0};
     if(data.nick && !localStorage.getItem('echo_noir_player_nick')) localStorage.setItem('echo_noir_player_nick', data.nick);
   }catch(e){}
 }
@@ -2016,26 +3310,173 @@ function refillInventoryAmmo(){
   }
   restoreWeaponState(player.weaponType||player.loadoutSlots[player.selectedSlot]||'m4', true);
 }
+function hasGear(key){
+  return !!(player.equippedGear && player.equippedGear[key]);
+}
+function earnedTokens(){ return Math.max(0, player.level|0) + Math.max(0,player.bonusTokens|0); }
+function awardTokens(n){
+  n = Math.max(0,n|0);
+  if(n<=0) return 0;
+  player.bonusTokens = Math.max(0,(player.bonusTokens|0) + n);
+  saveProgress();
+  return n;
+}
+function availableTokens(){ return Math.max(0, earnedTokens() - Math.max(0,player.tokensSpent|0)); }
+function spendTokens(n){
+  n = Math.max(0,n|0);
+  if(availableTokens() < n){ message='NEMÁŠ TOKENY'; messageTimer=1.2; return false; }
+  player.tokensSpent = Math.max(0,(player.tokensSpent|0) + n);
+  saveProgress();
+  return true;
+}
+function itemName(key){
+  if(equipmentDefs[key]) return equipmentDefs[key].name;
+  if(key==='ally_viktor') return 'Parťák Viktor';
+  if(key==='pet_basic') return 'Mazlíček';
+  return String(key||'ITEM');
+}
+function addInventoryItem(key,count=1){
+  if(!player.inventoryItems) player.inventoryItems = {};
+  player.inventoryItems[key] = Math.max(0,(player.inventoryItems[key]|0) + Math.max(1,count|0));
+  saveProgress();
+}
+function hasInventoryItem(key){ return !!(player.inventoryItems && (player.inventoryItems[key]|0)>0); }
+function buyEquipment(key){
+  const d = equipmentDefs[key];
+  if(!d) return false;
+  if(player.level < (d.level||1)){ message='POTŘEBA LEVEL '+(d.level||1); messageTimer=1.2; return false; }
+  if(hasInventoryItem(key)){ message='UŽ MÁŠ: '+d.name; messageTimer=1.0; return false; }
+  addInventoryItem(key,1);
+  message='KOUPENO: '+d.name;
+  messageTimer=1.2;
+  return true;
+}
+function useInventoryItem(key){
+  if(!hasInventoryItem(key)){ message='NEMÁŠ ITEM'; messageTimer=1.0; return false; }
+  if(equipmentDefs[key]){
+    if(!player.equippedGear) player.equippedGear = {};
+    const slot = equipmentDefs[key].slot;
+    for(const otherKey of equipmentOrder){
+      if(otherKey!==key && equipmentDefs[otherKey] && equipmentDefs[otherKey].slot===slot){
+        player.equippedGear[otherKey] = false;
+      }
+    }
+    player.equippedGear[key] = true;
+    recalcEquipmentStats();
+    saveProgress();
+    message='NASAZENO: '+equipmentDefs[key].name;
+    messageTimer=1.0;
+    return true;
+  }
+  if(key==='ally_viktor'){
+    player.equippedAlly = 'ally_viktor';
+    saveProgress();
+    message='PARŤÁK PŘIPRAVEN';
+    messageTimer=1.0;
+    return true;
+  }
+  if(key==='pet_basic'){
+    player.equippedPet = 'pet_basic';
+    pet.active = false;
+    saveProgress();
+    message='MAZLÍČEK PŘIPRAVEN';
+    messageTimer=1.0;
+    return true;
+  }
+  return false;
+}
+function unequipInventoryItem(key){
+  if(equipmentDefs[key]){
+    if(player.equippedGear) player.equippedGear[key] = false;
+    recalcEquipmentStats();
+    saveProgress();
+    message='DEMONTOVÁNO: '+equipmentDefs[key].name;
+    messageTimer=1.0;
+    return true;
+  }
+  if(key==='ally_viktor'){
+    player.equippedAlly = null;
+    companion.active=false;
+    saveProgress();
+    message='PARŤÁK DEMONTOVÁN';
+    messageTimer=1.0;
+    return true;
+  }
+  if(key==='pet_basic'){
+    player.equippedPet = null;
+    pet.active=false;
+    saveProgress();
+    message='MAZLÍČEK DEMONTOVÁN';
+    messageTimer=1.0;
+    return true;
+  }
+  return false;
+}
+function dropInventoryItem(key){
+  if(!player.inventoryItems || !hasInventoryItem(key)){ message='NEMÁŠ ITEM'; messageTimer=1.0; return false; }
+  unequipInventoryItem(key);
+  player.inventoryItems[key] = 0;
+  delete player.inventoryItems[key];
+  saveProgress();
+  message='VYHOZENO: '+itemName(key);
+  messageTimer=1.0;
+  return true;
+}
+function spentSkillPoints(){
+  const s = player.skills || {};
+  return (s.hp|0) + (s.str|0) + (s.speed|0) + (s.def|0);
+}
+function earnedSkillPoints(){
+  return earnedTokens();
+}
+function availableSkillPoints(){
+  return availableTokens();
+}
+function upgradeSkill(key){
+  if(!player.skills) player.skills = {hp:0,str:0,speed:0,def:0};
+  if(!['hp','str','speed','def'].includes(key)) return false;
+  if(!spendTokens(1)){
+    message = 'NEMÁŠ TOKEN';
+    messageTimer = 1.2;
+    return false;
+  }
+  player.skills[key] = Math.max(0,(player.skills[key]|0) + 1);
+  recalcEquipmentStats();
+  saveProgress();
+  const names={hp:'HP',str:'SÍLA',speed:'RYCHLOST',def:'OBRANA'};
+  message = names[key] + ' +1  (-1 TOKEN)';
+  messageTimer = 1.1;
+  return true;
+}
+function skillDamageMult(){
+  return 1 + (((player.skills && player.skills.str) || 0) * .05) + (player.gearStrBonus || 0);
+}
 function recalcEquipmentStats(){
   const oldMax = player.maxHp || 60;
-  let hp=0, armor=0;
+  const s = player.skills || {hp:0,str:0,speed:0,def:0};
+  let hp=0, armor=0, str=0;
   for(const key of equipmentOrder){
-    if(player.equippedGear && player.equippedGear[key]){ hp += equipmentDefs[key].hp||0; armor += equipmentDefs[key].armor||0; }
+    if(player.equippedGear && player.equippedGear[key]){
+      hp += equipmentDefs[key].hp||0;
+      armor += equipmentDefs[key].armor||0;
+      str += equipmentDefs[key].str||0;
+    }
   }
+  player.skillHpBonus = (s.hp|0) * 10;
+  player.skillSpeedBonus = (s.speed|0) * 7;
+  player.skillStrBonus = (s.str|0) * .05;
+  player.skillDefBonus = (s.def|0) * .025;
   player.gearHpBonus = hp;
-  player.armorProtection = clamp(armor,0,.28);
-  player.maxHp = 60 + hp;
+  player.gearStrBonus = str;
+  player.armorProtection = clamp(armor + player.skillDefBonus,0,.60);
+  player.maxHp = 60 + hp + player.skillHpBonus;
+  player.spd = 235 + player.skillSpeedBonus;
+  player.skillPoints = availableSkillPoints();
   if(player.hp > player.maxHp) player.hp = player.maxHp;
   else if(player.hp > 0 && player.maxHp > oldMax) player.hp = Math.min(player.maxHp, player.hp + (player.maxHp-oldMax));
 }
 function toggleEquipment(key){
-  if(!equipmentDefs[key]) return;
-  if(!player.equippedGear) player.equippedGear = {};
-  player.equippedGear[key] = !player.equippedGear[key];
-  recalcEquipmentStats();
-  saveProgress();
-  message = equipmentDefs[key].name + (player.equippedGear[key] ? ' NASAZENO' : ' SUNDÁNO');
-  messageTimer = 1.1;
+  buyEquipment(key);
 }
 
 function xpNeedForLevel(level){
@@ -2060,15 +3501,16 @@ function grantXp(amount=1){
   player.totalXp += amount;
   recalcPlayerLevel();
   saveProgress();
+  recalcEquipmentStats();
   if(player.level > prev){
-    message = 'LEVEL ' + player.level;
+    message = 'LEVEL ' + player.level + '  +1 TOKEN';
     messageTimer = 1.8;
   }
 }
 loadProgress();
-recalcEquipmentStats();
 online.playerName = getPlayerNick() || online.playerName || ('HRÁČ ' + online.clientId.slice(-4).toUpperCase());
 recalcPlayerLevel();
+recalcEquipmentStats();
 applyLoadout(player.weaponType, false, true);
 applyCharacter(player.characterKey, false);
 let enemies = [];
@@ -2089,13 +3531,146 @@ let securityAlarm = {x:0,y:0,timer:0,source:''};
 let wave = 1;
 let missionComplete = false;
 
+
+function arenaDoorSpawnPoint(d){
+  const cx=d.x+d.w/2, cy=d.y+d.h/2;
+  let x=cx,y=cy;
+  if(d.w>=d.h){
+    y = d.y < map.h/2 ? d.y + d.h + 38 : d.y - 38;
+    x = cx + rand(-d.w*.28,d.w*.28);
+  } else {
+    x = d.x < map.w/2 ? d.x + d.w + 38 : d.x - 38;
+    y = cy + rand(-d.h*.28,d.h*.28);
+  }
+  if(blockedCircle(x,y,24)){
+    const z=randomZone();
+    return randomClearPointInZone(z,80,40);
+  }
+  return {x,y};
+}
+function startArenaWave(){
+  if(selectedMissionKey!=='arena') return;
+  wave = Math.max(0,wave|0) + 1;
+  arenaWaveDelay = 0;
+  enemies = [];
+  const count = Math.min(36, 5 + Math.floor(wave * 1.05));
+  const doors = map.doors.length ? map.doors : [];
+  for(let i=0;i<count;i++){
+    let p,z;
+    if(doors.length){
+      const d=doors[i%doors.length];
+      d.timer = Math.max(d.timer||0, 2.4);
+      d.beacon = 1;
+      p = arenaDoorSpawnPoint(d);
+      z = randomZone();
+    } else {
+      z = randomZone();
+      p = randomClearPointInZone(z,80,40);
+    }
+    createEnemyAt(p.x,p.y,z);
+    const e = enemies[enemies.length-1];
+    e.alert = 3.2;
+    e.state = 'investigate';
+    e.lastSeenX = player.x; e.lastSeenY = player.y;
+    e.investigateX = player.x + rand(-120,120);
+    e.investigateY = player.y + rand(-120,120);
+    e.searchMapTimer = rand(.15,.75);
+  }
+  message = 'ARENA - VLNA ' + wave;
+  messageTimer = 1.7;
+  setMissionProgress('arena', Math.min(100, wave*2));
+  saveProgress();
+}
+function updateArenaWaves(dt){
+  if(selectedMissionKey!=='arena' || player.dead) return;
+  if(arenaCountdown > 0){
+    arenaCountdown = Math.max(0, arenaCountdown - dt);
+    message = 'ARENA START ZA ' + Math.ceil(arenaCountdown);
+    messageTimer = .25;
+    if(arenaCountdown <= 0) startArenaWave();
+    return;
+  }
+  if(enemies.length && enemies.every(e=>e.hp<=0)){
+    arenaWaveDelay -= dt;
+    if(arenaWaveDelay <= 0){
+      arenaWaveDelay = 2.0;
+      const nextSoon = enemies.every(e=>e.hp<=0);
+      if(nextSoon){
+        message = 'DALŠÍ VLNA';
+        messageTimer = .8;
+        startArenaWave();
+      }
+    }
+  }
+}
+function awardArenaDeathReward(){
+  if(selectedMissionKey!=='arena' || arenaRewarded) return 0;
+  arenaRewarded = true;
+  const reward = Math.floor(Math.max(0,wave|0) / 20);
+  arenaLastReward = reward;
+  if(reward > 0){
+    awardTokens(reward);
+    message = 'ARENA ODMĚNA +' + reward + ' TOKEN';
+    messageTimer = 3.0;
+  }
+  saveProgress();
+  saveArenaScoreToSupabase();
+  return reward;
+}
+function getArenaLeaderboardRows(){
+  const rows=[{name:getPlayerNick()||online.playerName||'TY',kills:player.kills|0,total:player.totalKills|0,level:player.level|0}];
+  if(online && online.remotePlayers){
+    for(const p of Object.values(online.remotePlayers)){
+      if(!p || Date.now()-(p.lastSeen||0)>9000) continue;
+      rows.push({name:p.name||'HRÁČ',kills:p.kills|0,total:p.totalKills|0,level:p.level|0});
+    }
+  }
+  rows.sort((a,b)=>(b.kills||0)-(a.kills||0) || (b.total||0)-(a.total||0) || (b.level||0)-(a.level||0));
+  return rows.slice(0,6);
+}
+function drawArenaLeaderboard(){
+  if(selectedMissionKey!=='arena' || gameMode!=='mission') return;
+  const x=W-326,y=104,w=304,h=206;
+  ctx.save();
+  ctx.fillStyle='rgba(0,0,0,.78)';
+  ctx.strokeStyle='#d20b1c';
+  ctx.lineWidth=3;
+  ctx.fillRect(x,y,w,h);
+  ctx.strokeRect(x,y,w,h);
+  ctx.font='24px Impact';
+  ctx.textAlign='center';
+  ctx.fillStyle='#fff';
+  ctx.fillText('ARENA TOP KILL',x+w/2,y+32);
+  ctx.font='13px Arial Black';
+  ctx.textAlign='left';
+  ctx.fillStyle='rgba(255,255,255,.65)';
+  ctx.fillText('HRÁČ',x+14,y+58);
+  ctx.fillText('KILL',x+205,y+58);
+  const rows=getArenaLeaderboardRows();
+  for(let i=0;i<rows.length;i++){
+    const r=rows[i], yy=y+80+i*19;
+    ctx.fillStyle=i===0?'#ffe07a':'#eee';
+    ctx.fillText((i+1)+'. '+String(r.name).slice(0,16),x+14,yy);
+    ctx.fillText(String(r.kills||0),x+210,yy);
+  }
+  ctx.font='13px Arial Black';
+  ctx.fillStyle='#ffdf7a';
+  ctx.textAlign='center';
+  ctx.fillText('VLNA '+Math.max(0,wave|0)+'   ODMĚNA: 1 TOKEN / 20 VLN',x+w/2,y+h-14);
+  ctx.restore();
+}
+
 function resetGame(){
+  cmdLog('MISSION','resetGame');
   gameMode = 'mission';
   lobbyUi = null;
+  if(selectedMissionKey==='vytah'){ missionElevator.floor=0; missionElevator.active=false; missionElevator.t=0; missionElevator.door=0; }
+  if(selectedMissionKey==='chaos'){ chaosCountdown=10; chaosSpawned=false; friendlyBots=[]; chaosTurrets=[]; }
   buildMap();
   recalcPlayerLevel();
   recalcEquipmentStats();
-  player.x=180; player.y=590; player.ang=0; player.hp=player.maxHp;
+  const sp = missionStartPoint();
+  player.x=sp.x; player.y=sp.y; player.safeX=player.x; player.safeY=player.y; player.ang=0; player.hp=player.maxHp;
   applyLoadout(player.weaponType, false, true);
   refillInventoryAmmo();
   player.shootCd=0; player.bt=100; player.score=0; player.kills=0; player.dead=false; player.muzzleFx=0; player.walk=0; player.moving=false; player.reloadMax=0;
@@ -2103,15 +3678,37 @@ function resetGame(){
   player.bleedTime=0; player.bleedNext=0; player.blood=[];
   enemies = []; turrets = []; cameras = []; bullets = []; grenades = []; explosions = []; craters = []; particles = []; pickups = []; shells = []; bulletMarks = []; bloodDecals = [];
   securityAlarm = {x:0,y:0,timer:0,source:''};
-  wave = 1; missionComplete=false; message='CÍL: ELIMINUJ VŠECHNY NEPŘÁTELE'; messageTimer=3.2; shake=0;
+  wave = (selectedMissionKey==='arena' || selectedMissionKey==='chaos') ? 0 : 1;
+  missionComplete=false; message=missionName+' - ELIMINUJ VŠECHNY NEPŘÁTELE'; messageTimer=3.2; shake=0;
+  arenaRewarded = false; arenaLastReward = 0;
+  arenaCountdown = selectedMissionKey==='arena' ? 10 : 0;
+  chaosCountdown = selectedMissionKey==='chaos' ? 10 : 0;
+  arenaWaveDelay = 0;
   resetFog();
-  spawnWave();
-  spawnSecurity();
+  if(selectedMissionKey==='arena'){
+    message = 'ARENA START ZA 10';
+    messageTimer = 10;
+  } else if(selectedMissionKey==='chaos'){
+    enemies=[]; turrets=[]; cameras=[]; friendlyBots=[]; chaosTurrets=[];
+    message = 'CHAOS START ZA 10';
+    messageTimer = 10;
+  } else if(selectedMissionKey==='vytah'){
+    enemies = [];
+    turrets = [];
+    cameras = [];
+    message = 'VÝTAH - OTEVŘI DVEŘE / PANEL';
+    messageTimer = 2.5;
+  } else {
+    spawnWave();
+    spawnSecurity();
+  }
+  setupCompanion();
   playMusic();
 }
 
+rebuildStaticSolids();
 function spawnWave(){
-  const count = 12 + wave * 4;
+  const count = 6 + wave * 2;
   const modes = ['patrol','guard','idle','wander'];
   const placed = [];
   for(let i=0;i<count;i++){
@@ -2277,14 +3874,62 @@ function getDoorPanels(d){
     {x:d.x, y:d.y + ph + ph*open, w:d.w, h:ph}
   ];
 }
-function eachSolidRect(cb){
-  for(const w of map.walls) cb(w);
-  for(const d of map.doors) for(const p of getDoorPanels(d)) cb(p);
-  for(const o of map.decor){
-    if(['pipe','doorLight','plant'].includes(o.t)) continue;
-    const pad = o.t==='chair' ? 3 : 6;
-    cb({x:o.x+pad,y:o.y+pad,w:Math.max(4,o.w-pad*2),h:Math.max(4,o.h-pad*2)});
+
+function nearestDoorForPlayer(range=82){
+  let best=null, bestD=1e9;
+  updateChaosBattle(dt, simDt);
+
+  for(const d of map.doors){
+    const cx=d.x+d.w/2, cy=d.y+d.h/2;
+    const dd=dist(player.x,player.y,cx,cy);
+    if(dd<range && dd<bestD){ best=d; bestD=dd; }
   }
+  return best;
+}
+function updateDoorInteraction(){
+  if(gameMode==='lobby') return;
+  const d=nearestDoorForPlayer(84);
+  if(!d) return;
+  player.pickupText='E: DVEŘE';
+  if(keys.e){
+    d.timer = selectedMissionKey==='vlak' ? 2.4 : 1.6;
+    d.beacon = 1;
+    if(d.open < .05 && d.snd <= 0) { playSound(soundPaths.door,.25); d.snd = .8; }
+    keys.e = false;
+  }
+}
+function updateArenaAmmoBox(){
+  if(selectedMissionKey!=='arena' || gameMode!=='mission') return;
+  for(const d of map.decor){
+    if(d.t!=='ammoBox') continue;
+    const cx=d.x+d.w/2, cy=d.y+d.h/2;
+    if(dist(player.x,player.y,cx,cy)<95){
+      player.pickupText='E: DOPLNIT NÁBOJE';
+      if(keys.e){
+        refillInventoryAmmo();
+        snapshotWeaponState();
+        playSound(soundPaths.pickup,.45);
+        beep(280,.08,.035,'triangle');
+        message='NÁBOJE DOPLNĚNY';
+        messageTimer=1.1;
+        keys.e=false;
+      }
+      return;
+    }
+  }
+}
+function rebuildStaticSolids(){
+  staticSolidRects.length = 0;
+  for(const w of map.walls) staticSolidRects.push(w);
+  for(const o of map.decor){
+    if(['pipe','doorLight','plant','labelMission','labelLoadout','chair','elevatorCabin','panel','labelArena'].includes(o.t)) continue;
+    const pad = o.t==='crate' ? 8 : 14;
+    staticSolidRects.push({x:o.x+pad,y:o.y+pad,w:Math.max(4,o.w-pad*2),h:Math.max(4,o.h-pad*2)});
+  }
+}
+function eachSolidRect(cb){
+  for(const r of staticSolidRects) cb(r);
+  for(const d of map.doors) for(const p of getDoorPanels(d)) cb(p);
 }
 function blockedCircle(x,y,r){
   let hit = false;
@@ -2305,7 +3950,7 @@ function moveCircle(obj, vx, vy, dt){
 }
 function startCameraShake(power=8,dur=.22){
   shake = Math.max(shake,power);
-  shakeTimer = Math.max(shakeTimer,dur);
+  shakeTimer = Math.max(shakeTimer,Math.min(2,dur));
 }
 function updatePlayerRecoil(dt){
   const s = Math.hypot(player.recoilVX||0, player.recoilVY||0);
@@ -2336,7 +3981,7 @@ function updateShadowStealth(dt, moving){
   const recoilMoving = Math.hypot(player.recoilVX||0, player.recoilVY||0) > 18;
   if(!moving && !recoilMoving && nearWallForShadow()){
     player.shadowTime += dt;
-    player.hiddenInShadow = player.shadowTime >= 3.0;
+    player.hiddenInShadow = player.shadowTime >= 2.0;
   } else {
     player.shadowTime = 0;
     player.hiddenInShadow = false;
@@ -2357,7 +4002,7 @@ function steerVelocity(obj, vx, vy, dt){
   const base = Math.atan2(vy,vx);
   const look = clamp(speed*dt + 34, 28, 76);
   if(walkRayClear(obj.x,obj.y,base,look,obj.r)) return {vx,vy};
-  const probes = [0.35,-0.35,0.70,-0.70,1.05,-1.05,1.57,-1.57,2.20,-2.20,Math.PI];
+  const probes = [0.25,-0.25,0.50,-0.50,0.82,-0.82,1.18,-1.18,1.57,-1.57,2.20,-2.20,Math.PI];
   for(const off of probes){
     const a = base + off;
     if(walkRayClear(obj.x,obj.y,a,look,obj.r)){
@@ -2366,11 +4011,93 @@ function steerVelocity(obj, vx, vy, dt){
   }
   return {vx:0,vy:0};
 }
+const NAV_CELL = 160;
+function navCell(x,y){
+  return {ix:clamp(Math.floor(x/NAV_CELL),0,Math.floor(map.w/NAV_CELL)), iy:clamp(Math.floor(y/NAV_CELL),0,Math.floor(map.h/NAV_CELL))};
+}
+function navCenter(ix,iy){
+  return {x:clamp(ix*NAV_CELL+NAV_CELL/2,80,map.w-80), y:clamp(iy*NAV_CELL+NAV_CELL/2,80,map.h-80)};
+}
+function navWalkable(ix,iy,r=18){
+  const p = navCenter(ix,iy);
+  return !blockedCircle(p.x,p.y,r);
+}
+function findEnemyPath(sx,sy,gx,gy,r=18){
+  if(pathSearchBudget <= 0) return [{x:gx,y:gy}];
+  pathSearchBudget--;
+  const start = navCell(sx,sy), goal = navCell(gx,gy);
+  const key = (ix,iy)=>ix+','+iy;
+  const open = [{ix:start.ix,iy:start.iy,g:0,f:dist(sx,sy,gx,gy)}];
+  const came = new Map();
+  const cost = new Map([[key(start.ix,start.iy),0]]);
+  const maxIx = Math.floor(map.w/NAV_CELL), maxIy = Math.floor(map.h/NAV_CELL);
+  const dirs = [[1,0],[-1,0],[0,1],[0,-1],[1,1],[1,-1],[-1,1],[-1,-1]];
+  let endKey = null, best = open[0], expansions = 0;
+  while(open.length && expansions < 80){
+    open.sort((a,b)=>a.f-b.f);
+    const cur = open.shift();
+    expansions++;
+    const h = Math.abs(cur.ix-goal.ix)+Math.abs(cur.iy-goal.iy);
+    if(h < Math.abs(best.ix-goal.ix)+Math.abs(best.iy-goal.iy)) best = cur;
+    if(cur.ix===goal.ix && cur.iy===goal.iy){ endKey = key(cur.ix,cur.iy); break; }
+    for(const d of dirs){
+      const nix=cur.ix+d[0], niy=cur.iy+d[1];
+      if(nix<0 || niy<0 || nix>maxIx || niy>maxIy) continue;
+      if(!navWalkable(nix,niy,r)) continue;
+      if(d[0] && d[1] && (!navWalkable(cur.ix+d[0],cur.iy,r) || !navWalkable(cur.ix,cur.iy+d[1],r))) continue;
+      const nk=key(nix,niy), step=d[0]&&d[1]?1.42:1;
+      const ng=(cost.get(key(cur.ix,cur.iy))||0)+step;
+      if(!cost.has(nk) || ng < cost.get(nk)){
+        cost.set(nk,ng);
+        came.set(nk,key(cur.ix,cur.iy));
+        const pp=navCenter(nix,niy);
+        open.push({ix:nix,iy:niy,g:ng,f:ng+dist(pp.x,pp.y,gx,gy)/NAV_CELL});
+      }
+    }
+  }
+  if(!endKey) endKey = key(best.ix,best.iy);
+  const path = [];
+  let curKey = endKey;
+  let guard = 0;
+  while(curKey && guard++ < 80){
+    const parts = curKey.split(',');
+    path.push(navCenter(+parts[0],+parts[1]));
+    if(curKey === key(start.ix,start.iy)) break;
+    curKey = came.get(curKey);
+  }
+  path.reverse();
+  if(path.length && dist(path[0].x,path[0].y,sx,sy)<48) path.shift();
+  path.push({x:gx,y:gy});
+  return path.slice(0,12);
+}
+function directWalkTo(x,y,tx,ty,r=20){
+  const d = dist(x,y,tx,ty);
+  if(d < 4) return true;
+  return walkRayClear(x,y,angleTo(x,y,tx,ty),Math.min(d,760),r);
+}
+function enemyPathTarget(e, tx, ty, dt){
+  // Hlavní optimalizace mise: žádný A* výpočet každý frame.
+  // NPC míří na cíl a překážky řeší steerVelocity; když se zasekne 3 s, dostane jiný cíl.
+  return {x:tx,y:ty};
+}
+function resetEnemyPath(e){
+  e.path = null;
+  e.pathTimer = 0;
+  e.pathGoalX = NaN;
+  e.pathGoalY = NaN;
+}
 function pointInWall(x,y){
   if(x < 0 || y < 0 || x > map.w || y > map.h) return true;
-  let hit = false;
-  eachSolidRect(w => { if(!hit && x>=w.x && x<=w.x+w.w && y>=w.y && y<=w.y+w.h) hit = true; });
-  return hit;
+  for(const w of staticSolidRects){
+    if(x>=w.x && x<=w.x+w.w && y>=w.y && y<=w.y+w.h) return true;
+  }
+  for(const d of map.doors){
+    const panels = getDoorPanels(d);
+    for(const p of panels){
+      if(x>=p.x && x<=p.x+p.w && y>=p.y && y<=p.y+p.h) return true;
+    }
+  }
+  return false;
 }
 function castLightDistance(x,y,a,maxLen){
   const step = 10;
@@ -2402,14 +4129,15 @@ function segmentRectHit(x1,y1,x2,y2,r,rect){
   }
   return true;
 }
-function los(x1,y1,x2,y2, pad=5){
+function los(x1,y1,x2,y2, pad=2){
   if(pointInWall(x1,y1) || pointInWall(x2,y2)) return false;
+  // méně boxově: hlavní je pixelové vzorkování paprsku, rect test má jen malý pad
   let blocked = false;
   eachSolidRect(r => {
-    if(!blocked && segmentRectHit(x1,y1,x2,y2,pad,r)) blocked = true;
+    if(!blocked && segmentRectHit(x1,y1,x2,y2,Math.min(2,pad),r)) blocked = true;
   });
   if(blocked) return false;
-  const steps = Math.max(2, Math.ceil(Math.hypot(x2-x1,y2-y1)/5));
+  const steps = Math.max(2, Math.ceil(Math.hypot(x2-x1,y2-y1)/4));
   for(let i=1;i<steps;i++){
     const t=i/steps;
     if(pointInWall(x1+(x2-x1)*t,y1+(y2-y1)*t)) return false;
@@ -2448,8 +4176,10 @@ function enemySeesPlayer(e){
   return d <= castLightDistance(e.x,e.y,a,e.kind==='scout'?540:480) + 8;
 }
 function pushParticle(x,y,vx,vy,life,size,kind='spark'){
+  if(perfMode>=2 && (kind==='smoke' || kind==='dust')) return;
   particles.push({x,y,vx,vy,life,max:life,size,kind});
-  if(particles.length > 180) particles.splice(0, particles.length - 180);
+  const cap = perfMode>=2 ? 34 : perfMode>=1 ? 48 : 58;
+  if(particles.length > cap) particles.splice(0, particles.length - cap);
 }
 function splatter(x,y,n=8,power=1,color='red'){
   // Bez explozivního rozprsknutí krve. Krev řeší decals/louže a sprayBloodToWall.
@@ -2469,7 +4199,8 @@ function addBloodDecal(x,y,size=10,onWall=false,a=0,color='red'){
     drips:onWall ? 1+((Math.random()*3)|0) : ((Math.random()*3)|0),
     seed:Math.random()*1000
   });
-  if(bloodDecals.length > 160) bloodDecals.splice(0, bloodDecals.length - 160);
+  const bloodCap = perfMode>=2 ? 28 : perfMode>=1 ? 40 : 55;
+  if(bloodDecals.length > bloodCap) bloodDecals.splice(0, bloodDecals.length - bloodCap);
 }
 function sprayBloodToWall(x,y,a,maxLen=90,color='red'){
   const step = 6;
@@ -2484,11 +4215,13 @@ function sprayBloodToWall(x,y,a,maxLen=90,color='red'){
 }
 
 function muzzle(x,y,a){
-  for(let i=0;i<16;i++){
+  const sparkCount = perfMode>=2 ? 4 : perfMode>=1 ? 7 : 10;
+  const smokeCount = perfMode>=2 ? 1 : perfMode>=1 ? 3 : 5;
+  for(let i=0;i<sparkCount;i++){
     const aa=a+rand(-.24,.24), s=rand(180,420);
     pushParticle(x,y,Math.cos(aa)*s,Math.sin(aa)*s,rand(.05,.18),rand(2,6),'spark');
   }
-  for(let i=0;i<12;i++){
+  for(let i=0;i<smokeCount;i++){
     const aa=a+rand(-.20,.20), s=rand(35,120);
     pushParticle(x,y,Math.cos(aa)*s,Math.sin(aa)*s,rand(.12,.34),rand(7,15),'smoke');
   }
@@ -2537,7 +4270,7 @@ function dropShell(x,y,a,power=1){
     size:rand(.85,1.25) * (.9 + power*.18)
   });
 
-  while(shells.length > 180){
+  while(shells.length > 55){
     const old = shells.shift();
     old.vx=old.vy=old.spin=0;
     bakeShell(old);
@@ -2545,7 +4278,7 @@ function dropShell(x,y,a,power=1){
 }
 function addBulletMark(x,y,a){
   bulletMarks.push({x,y,a,size:rand(3.5,6.5)});
-  if(bulletMarks.length > 420) bulletMarks.splice(0, bulletMarks.length - 420);
+  if(bulletMarks.length > 160) bulletMarks.splice(0, bulletMarks.length - 160);
 }
 
 function safeMuzzlePoint(x,y,a,desired){
@@ -2575,6 +4308,19 @@ function broadcastShot(x,y,a,weaponType){
     }});
   }catch(e){}
 }
+function broadcastStep(){
+  if(!online.active || !online.roomChannel) return;
+  try{
+    online.roomChannel.send({type:'broadcast',event:'step',payload:{
+      id:online.clientId,name:online.playerName,roomId:online.roomId,
+      x:player.x,y:player.y,mission:selectedMissionKey,gameMode,t:Date.now()
+    }});
+  }catch(e){}
+}
+function playFootstepSound(){
+  playSound(soundPaths.step,.22);
+  broadcastStep();
+}
 function spawnRemoteShot(data){
   const wt = data.weaponType && weaponDefs[data.weaponType] ? data.weaponType : 'm4';
   const def = weaponDefs[wt] || weaponDefs.m4;
@@ -2599,6 +4345,16 @@ function shoot(owner, x,y,a, dmg, speed, spread=.035){
   const isPlayer = owner === 'p';
   const def = isPlayer && player.weaponType ? weaponDefs[player.weaponType] : null;
   const muzzleDist = def ? def.muzzleDist : (isPlayer ? 58 : 24);
+  if(isPlayer){
+    const clearDist = Math.max(muzzleDist, (player.r||20)+12);
+    for(let d=(player.r||20)*.55; d<=clearDist; d+=4){
+      const tx=x+Math.cos(a)*d, ty=y+Math.sin(a)*d;
+      if(pointInWall(tx,ty) || bulletSegmentHitsSolid(x,y,tx,ty)){
+        player.muzzleFx = 0;
+        return false;
+      }
+    }
+  }
   const mp = safeMuzzlePoint(x,y,a,muzzleDist);
   const bx = mp.x;
   const by = mp.y;
@@ -2612,7 +4368,7 @@ function shoot(owner, x,y,a, dmg, speed, spread=.035){
   if(isPlayer) broadcastShot(x,y,a,player.weaponType);
   playSound(isPlayer && def ? def.sound : soundPaths.weapons.ak47, isPlayer ? .62 : .32);
   if(isPlayer && def){
-    noise.x = x; noise.y = y; noise.timer = .95;
+    noise.x = x; noise.y = y; noise.timer = .95; noise.type='shot';
     const shellAng = a + Math.PI/2;
     dropShell(
       x + Math.cos(a)*def.shellOffsetForward + Math.cos(shellAng)*def.shellOffsetSide,
@@ -2625,7 +4381,7 @@ function shoot(owner, x,y,a, dmg, speed, spread=.035){
       const sa = a + rand(-.16,.16), sv = rand(22,92);
       pushParticle(bx + Math.cos(a)*4, by + Math.sin(a)*4, Math.cos(sa)*sv, Math.sin(sa)*sv, rand(.12,.28), rand(6,13), 'smoke');
     }
-  } else if(!isPlayer) {
+  } else if(owner==='e') {
     startCameraShake(1.4,.12);
   }
   beep(owner==='p'?92:70,.045,owner==='p'?.055:.025,'sawtooth');
@@ -2650,6 +4406,16 @@ function throwGrenade(){
   for(let i=0;i<8;i++) pushParticle(gx,gy,rand(-50,50),rand(-50,50),rand(.12,.25),rand(3,7),'smoke');
   consumeCurrentSlotAfterUse();
 }
+function dropEnemyPickup(e){
+  if(!e) return;
+  const chance = selectedMissionKey==='arena' ? .55 : .38;
+  if(Math.random() >= chance) return;
+  const type = selectedMissionKey==='arena'
+    ? (Math.random()<.48 ? 'med' : 'ammo')
+    : (Math.random()<.32 ? 'med' : 'ammo');
+  pickups.push({x:e.x+rand(-18,18),y:e.y+rand(-18,18),type,r:13});
+}
+
 function damageEnemyExplosion(e,dmg,ang){
   if(e.hp<=0) return;
   e.hp -= dmg;
@@ -2663,7 +4429,7 @@ function damageEnemyExplosion(e,dmg,ang){
     e.hp=0; e.corpseDX=Math.cos(ang)*rand(30,55); e.corpseDY=Math.sin(ang)*rand(30,55); e.corpseRot=rand(-1.4,1.4); e.corpseAnim=0;
     e.bleedTime=rand(5,9); e.bleedNext=rand(.08,.18);
     addBloodDecal(e.x+rand(-20,20),e.y+rand(-20,20),rand(28,52),false,ang,e.bloodColor);
-    if(Math.random()<.35) pickups.push({x:e.x+rand(-18,18),y:e.y+rand(-18,18),type:Math.random()<.55?'ammo':'med',r:13});
+    dropEnemyPickup(e);
   }
 }
 function explodeGrenade(g){
@@ -2738,11 +4504,14 @@ function updatePlayerWeapon(dt, simDt){
     snapshotWeaponState();
     player.shootCd = w.fireDelay;
     const spread = w.spread + (player.moving ? (w.pellets>1 ? .020 : .014) : .004) + (keys.shift ? .010 : 0);
-    shoot('p',player.x,player.y,player.ang,w.damage,w.speed,spread);
+    shoot('p',player.x,player.y,player.ang,w.damage * skillDamageMult(),w.speed,spread);
+    const push = (w.recoil || 80);
+    player.recoilVX -= Math.cos(player.ang)*push;
+    player.recoilVY -= Math.sin(player.ang)*push;
     if(player.weaponType === 'sniper' && player.trollSniper){
       player.recoilVX -= Math.cos(player.ang)*980;
       player.recoilVY -= Math.sin(player.ang)*980;
-      startCameraShake(13,3.0);
+      startCameraShake(9,1.2);
       player.muzzleFx = .16;
     }
   }
@@ -2768,7 +4537,7 @@ function updateLooseFx(dt, simDt){
     b.life -= simDt;
     b.px = b.x; b.py = b.y;
     b.x += b.vx*simDt; b.y += b.vy*simDt;
-    if(gameMode==='lobby' && b.owner==='p'){
+    if(gameMode==='lobby' && (b.owner==='p' || b.owner==='a')){
       for(const t of lobbyTargets){
         if(t.hp>0 && dist(b.x,b.y,t.x,t.y)<t.r+6){
           b.life=0;
@@ -2788,8 +4557,11 @@ function updateLooseFx(dt, simDt){
     }
   }
   bullets = bullets.filter(b=>b.life>0);
+  if(bullets.length > 220) bullets.splice(0, bullets.length - 220);
   for(const p of particles){ p.life -= dt; p.x += p.vx*dt; p.y += p.vy*dt; p.vx*=Math.pow(.08,dt); p.vy*=Math.pow(.08,dt); }
   particles = particles.filter(p=>p.life>0);
+  const particleHardCap = perfMode>=2 ? 34 : perfMode>=1 ? 48 : 58;
+  if(particles.length > particleHardCap) particles.splice(0, particles.length - particleHardCap);
   for(const s of shells){
     s.age += dt;
     let nx = s.x + s.vx*dt;
@@ -2814,17 +4586,32 @@ function updateLooseFx(dt, simDt){
 }
 
 function update(dt){
+  cmdStateTimer += dt;
+  if(cmdStateTimer >= .45){
+    cmdStateTimer = 0;
+    updateCmdState();
+  }
+  pathSearchBudget = 3;
   if(state==='loading'){
-    loadingTimer -= dt;
-    if(loadingTimer <= 0){
-      if(!getPlayerNick()) openNickEditor();
-      else afterNickReady();
+    if(preload.done || !preload.active){
+      loadingTimer -= dt;
+      if(loadingTimer <= 0){
+        if(!getPlayerNick()) openNickEditor();
+        else afterNickReady();
+      }
     }
+    return;
+  }
+  if(state==='missionLoading'){
     return;
   }
   if(state==='nick') return;
   onlineTick(dt);
-  revealSharedFog();
+  fogShareTimer += dt;
+  if(fogShareTimer >= .18){
+    fogShareTimer = 0;
+    revealSharedFog();
+  }
   if(state==='menu' && menuStep==='searching'){
     searchTimer -= dt;
     if(searchTimer <= 0){ menuStep='lobby'; roomCreated=false; }
@@ -2839,6 +4626,7 @@ function update(dt){
     updateLobby(dt);
     return;
   }
+  if(updateMissionElevator(dt)) return;
   noise.timer = Math.max(0, noise.timer - dt);
   securityAlarm.timer = Math.max(0, securityAlarm.timer - dt);
   const wantBT = keys[' '] && player.bt>0 && !player.dead;
@@ -2859,14 +4647,40 @@ function update(dt){
   const speed = player.spd * (wantBT ? .92 : 1) * (sprinting ? 1.55 : 1);
   player.moving = magReal > 0.05 && !player.dead;
   if(player.moving) player.walk += dt * (sprinting ? 18 : 12);
+  stepSoundTimer = Math.max(0, stepSoundTimer - dt);
+  if(player.moving && stepSoundTimer <= 0){
+    stepSoundTimer = sprinting ? .26 : .40;
+    playFootstepSound();
+  }
   if(!player.dead) {
+    const px0 = player.x, py0 = player.y;
     moveCircle(player, mx/mag*speed, my/mag*speed, simDt);
+    if(blockedCircle(player.x,player.y,player.r)){
+      player.x = Number.isFinite(player.safeX) ? player.safeX : px0;
+      player.y = Number.isFinite(player.safeY) ? player.safeY : py0;
+    } else {
+      player.safeX = player.x; player.safeY = player.y;
+    }
     updatePlayerRecoil(dt);
+    updatePet(dt, simDt);
+    if(blockedCircle(player.x,player.y,player.r)){
+      player.x = Number.isFinite(player.safeX) ? player.safeX : px0;
+      player.y = Number.isFinite(player.safeY) ? player.safeY : py0;
+      player.recoilVX=0; player.recoilVY=0;
+    } else {
+      player.safeX = player.x; player.safeY = player.y;
+    }
     updateShadowStealth(dt, player.moving);
-    revealFog(player.x, player.y, 255);
+    footNoiseTimer = Math.max(0, footNoiseTimer - simDt);
+    if(player.moving && footNoiseTimer <= 0 && !player.hiddenInShadow){
+      footNoiseTimer = sprinting ? .22 : .42;
+      noise.x = player.x; noise.y = player.y; noise.timer = sprinting ? .42 : .28; noise.type='step';
+    }
+    revealFog(player.x, player.y, 360);
   }
 
   updatePlayerWeapon(dt, simDt);
+  updateCompanion(dt, simDt);
   updateAlarmButtons(simDt);
 
   for(const c of cameras){
@@ -2885,7 +4699,7 @@ function update(dt){
       for(const e of enemies){
         if(e.hp>0){
           e.alert = Math.max(e.alert, 3.4);
-          if(!e.buttonTried && Math.random()<.10){
+          if(!e.buttonTried && Math.random()<.01){
             const b=nearestAlarmButton(e.x,e.y);
             if(b){ e.buttonTarget=b.id; e.buttonTried=true; e.state='pressButton'; }
           } else {
@@ -2916,11 +4730,12 @@ function update(dt){
       if(t.shootCd <= 0){
         t.shootCd = .13 + Math.random() * .05;
         t.muzzleFx = .1;
-        shoot('e', t.x, t.y, t.ang, 34, 760, .045);
+        shoot('e', t.x, t.y, t.ang, 125, 820, .04);
       }
     } else if(t.spottedTimer <= 0) t.spotted = false;
   }
 
+  const deadEnemyCount = enemies.reduce((n,q)=>n+(q.hp<=0?1:0),0);
   for(const e of enemies){
     if(e.hp <= 0){
       e.muzzleFx = Math.max(0, e.muzzleFx - dt*1.9);
@@ -2928,7 +4743,7 @@ function update(dt){
       if(e.bleedTime > 0){
         e.bleedTime = Math.max(0, e.bleedTime - simDt);
         e.bleedNext -= simDt;
-        if(e.bleedNext <= 0 && enemies.filter(q=>q.hp<=0).length < 24){
+        if(e.bleedNext <= 0 && deadEnemyCount < 24){
           const deadT = clamp((e.corpseAnim||0) / (e.corpseAnimMax||.24), 0, 1);
           const cx = e.x + (e.corpseDX||0) * deadT + rand(-10,10);
           const cy = e.y + (e.corpseDY||0) * deadT + rand(-10,10);
@@ -2958,7 +4773,9 @@ function update(dt){
     const d = dist(e.x,e.y,player.x,player.y);
     const toPlayer = angleTo(e.x,e.y,player.x,player.y);
     const canSee = enemySeesPlayer(e);
-    const hearRange = e.kind==='scout' ? 760 : e.kind==='heavy' ? 540 : 650;
+    const hearRange = noise.type==='shot'
+      ? (e.kind==='scout' ? 760 : e.kind==='heavy' ? 540 : 650)
+      : (e.kind==='scout' ? 320 : e.kind==='heavy' ? 220 : 270);
     const heardNoise = noise.timer > 0 && dist(e.x,e.y,noise.x,noise.y) < hearRange;
 
     e.reload = Math.max(0, e.reload - simDt);
@@ -2968,7 +4785,7 @@ function update(dt){
 
     if(canSee){
       e.alert = Math.max(e.alert, 3.2);
-      if(!e.buttonTried && Math.random()<.10){
+      if(!e.buttonTried && Math.random()<.01){
         const b=nearestAlarmButton(e.x,e.y);
         if(b){ e.buttonTarget=b.id; e.buttonTried=true; e.state='pressButton'; }
         else e.state='engage';
@@ -2989,10 +4806,11 @@ function update(dt){
         e.searchMapTimer = rand(2.0,4.5);
       }
     } else if(heardNoise){
-      e.alert = Math.max(e.alert, 1.8);
+      e.alert = Math.max(e.alert, noise.type==='shot' ? 2.2 : 1.35);
       if(e.state !== 'engage') e.state = 'investigate';
-      e.investigateX = noise.x + rand(-45,45);
-      e.investigateY = noise.y + rand(-45,45);
+      const spread = noise.type==='shot' ? 60 : 34;
+      e.investigateX = noise.x + rand(-spread,spread);
+      e.investigateY = noise.y + rand(-spread,spread);
     } else {
       e.alert = Math.max(0, e.alert - simDt);
       if(e.alert > 0.1 && e.state === 'engage') e.state = 'investigate';
@@ -3002,7 +4820,8 @@ function update(dt){
     if(buttonTarget){
       e.state='pressButton';
       const bd=dist(e.x,e.y,buttonTarget.x,buttonTarget.y);
-      const ta=angleTo(e.x,e.y,buttonTarget.x,buttonTarget.y);
+      const nav = enemyPathTarget(e, buttonTarget.x, buttonTarget.y, simDt);
+      const ta=angleTo(e.x,e.y,nav.x,nav.y);
       e.ang += angleDiff(ta,e.ang) * clamp(simDt*7.8,0,.95);
       if(bd>30){
         vx=Math.cos(e.ang)*e.spd*.86;
@@ -3014,8 +4833,9 @@ function update(dt){
         e.state='investigate';
       }
     } else if(canSee || e.alert > 0.1){
-      const tx = canSee ? player.x : e.investigateX;
-      const ty = canSee ? player.y : e.investigateY;
+      const nav = canSee ? {x:player.x,y:player.y} : enemyPathTarget(e, e.investigateX, e.investigateY, simDt);
+      const tx = nav.x;
+      const ty = nav.y;
       const ta = angleTo(e.x,e.y,tx,ty);
       e.ang += angleDiff(ta, e.ang) * clamp(simDt * 6.8, 0, .9);
 
@@ -3047,7 +4867,7 @@ function update(dt){
             e.ammo--;
             e.shootCd = e.kind==='heavy' ? .22 : e.kind==='scout' ? .60 : e.kind==='mirror' ? .30 : .42;
             e.muzzleFx = .09;
-            const dmg = e.kind==='heavy' ? 52 : e.kind==='scout' ? 34 : 42;
+            const dmg = e.kind==='heavy' ? 155 : e.kind==='scout' ? 105 : 125;
             const spd = e.kind==='heavy' ? 620 : e.kind==='scout' ? 540 : 590;
             const spread = e.kind==='heavy' ? .15 : e.kind==='scout' ? .22 : e.kind==='mirror' ? .12 : .17;
             shoot('e',e.x,e.y,e.ang,dmg,spd,spread);
@@ -3083,10 +4903,11 @@ function update(dt){
         if(td < 18 || e.wait <= 0 || !Number.isFinite(e.roamX) || !Number.isFinite(e.roamY)){
           const pad = e.aiMode === 'wander' ? 80 : 52;
           const target = randomClearPointInZone(e.zone, pad, 25);
-          e.roamX = target.x; e.roamY = target.y; e.wait = rand(.8, 2.8);
+          e.roamX = target.x; e.roamY = target.y; e.wait = rand(.8, 2.8); resetEnemyPath(e);
         }
-        const aa = angleTo(e.x,e.y,e.roamX,e.roamY);
-        e.ang += angleDiff(aa, e.ang) * .045;
+        const nav = enemyPathTarget(e, e.roamX, e.roamY, simDt);
+        const aa = angleTo(e.x,e.y,nav.x,nav.y);
+        e.ang += angleDiff(aa, e.ang) * .065;
         if(td > 16){
           const mult = e.aiMode === 'wander' ? .20 : .34;
           vx = Math.cos(e.ang) * e.spd * mult;
@@ -3100,47 +4921,51 @@ function update(dt){
       const s = steerVelocity(e, vx, vy, simDt);
       vx = s.vx; vy = s.vy;
     }
-    const moved = moveCircle(e,vx,vy,simDt);
-    if(wantedMove && !moved){
+    const oldEx = e.x, oldEy = e.y;
+    moveCircle(e,vx,vy,simDt);
+    const movedAmount = dist(oldEx,oldEy,e.x,e.y);
+    if(wantedMove && movedAmount < 1.15){
       e.stuck = (e.stuck || 0) + simDt;
-      e.ang += rand(-1.4,1.4) + Math.PI*.55;
-      const target = randomClearPointInZone(e.zone, 80, 30);
-      e.roamX = target.x; e.roamY = target.y;
-      e.investigateX = target.x; e.investigateY = target.y;
-      e.wait = rand(.15,.6);
-      // malý postranní náraz, aby se nelepili o nábytek
-      moveCircle(e, Math.cos(e.ang)*e.spd*.35, Math.sin(e.ang)*e.spd*.35, simDt);
+      if(e.stuck > 3.0){
+        resetEnemyPath(e);
+        const z = randomZone();
+        const target = randomClearPointInZone(z, 90, 45);
+        e.zone = z;
+        e.roamX = target.x; e.roamY = target.y;
+        e.investigateX = target.x; e.investigateY = target.y;
+        e.lastSeenX = target.x; e.lastSeenY = target.y;
+        e.ang = angleTo(e.x,e.y,target.x,target.y) + rand(-.45,.45);
+        e.wait = rand(.2,.7);
+        e.stuck = 0;
+        // poslední malé odlepení až po 3 sekundách zaseknutí
+        moveCircle(e, Math.cos(e.ang)*e.spd*.45, Math.sin(e.ang)*e.spd*.45, simDt);
+      }
     } else {
-      e.stuck = 0;
+      e.stuck = Math.max(0,(e.stuck||0)-simDt*1.8);
     }
     e.x = clamp(e.x, 90, map.w - 90);
     e.y = clamp(e.y, 90, map.h - 90);
     if(blockedCircle(e.x,e.y,e.r)){
       const target = randomClearPointInZone(e.zone || randomZone(), 90, 50);
-      e.x = target.x; e.y = target.y;
-      e.roamX = target.x; e.roamY = target.y;
+      if(dist(e.x,e.y,target.x,target.y) < 900){
+        e.x = target.x; e.y = target.y;
+        e.roamX = target.x; e.roamY = target.y;
+        resetEnemyPath(e);
+      } else {
+        e.ang += Math.PI * .5 + rand(-.6,.6);
+      }
     }
   }
 
   for(const d of map.doors){
-    const cx = d.x + d.w/2, cy = d.y + d.h/2;
-    let trigger = dist(player.x,player.y,cx,cy) < 115;
-    if(!trigger){
-      for(const e of enemies){
-        if(dist(e.x,e.y,cx,cy) < 100){ trigger = true; break; }
-      }
-    }
-    if(trigger){
-      d.timer = 1.15;
+    if(d.timer > 0){
+      d.timer -= simDt;
       d.beacon = 1;
-      if(d.open < .05 && d.snd <= 0) { playSound(soundPaths.door,.25); d.snd = .8; }
-      d.open = Math.min(1, d.open + simDt*.22);
-    }
-    else if(d.timer > 0) { d.timer -= simDt; d.beacon = 1; }
-    else {
-      if(d.open > .95 && d.snd <= 0) { playSound(soundPaths.door,.22); d.snd = .8; }
+      d.open = Math.min(1, d.open + simDt*.42);
+    } else {
+      if(d.open > .92 && d.snd <= 0) { playSound(soundPaths.door,.22); d.snd = .8; }
       if(d.open > 0) d.beacon = 1;
-      d.open = Math.max(0, d.open - simDt*.14);
+      d.open = Math.max(0, d.open - simDt*.18);
     }
     d.snd = Math.max(0, d.snd - dt);
   }
@@ -3158,7 +4983,7 @@ function update(dt){
       else for(let i=0;i<5;i++) pushParticle(b.x,b.y,rand(-70,70),rand(-70,70),rand(.15,.38),rand(1,3),'dust');
       continue;
     }
-    if(b.owner==='p'){
+    if(b.owner==='p' || b.owner==='a'){
       for(const c of cameras){
         if(c.hp>0 && dist(b.x,b.y,c.x,c.y)<c.r+9){
           b.life=0;
@@ -3216,13 +5041,30 @@ function update(dt){
             addBloodDecal(e.x + rand(-36,36), e.y + rand(-36,36), rand(22,48), false, rand(-Math.PI,Math.PI), bcol);
             sprayBloodToWall(e.x,e.y,hitAng,150,bcol);
             if(Math.random() < .86) sprayBloodToWall(e.x,e.y,hitAng + rand(-.7,.7),165,bcol);
-            if(Math.random()<.42) pickups.push({x:e.x+rand(-18,18),y:e.y+rand(-18,18),type:Math.random()<.55?'ammo':'med',r:13});
+            dropEnemyPickup(e);
           }
           break;
         }
       }
-    } else if(b.owner==='e' && dist(b.x,b.y,player.x,player.y)<player.r+4 && !player.dead){
-      const realDmg = Math.max(1, b.dmg * (1 - (player.armorProtection||0)));
+    } else if(b.owner==='e'){
+      let hitFriendlyBot=false;
+      if(selectedMissionKey==='chaos'){
+        for(const f of friendlyBots){
+          if(f.hp>0 && dist(b.x,b.y,f.x,f.y)<f.r+4){
+            f.hp -= Math.max(26,b.dmg*.58);
+            b.life=0; hitFriendlyBot=true; playSound(soundPaths.hit,.22);
+            const hitAng=Math.atan2(b.vy,b.vx);
+            addBloodDecal(f.x+rand(-10,10),f.y+rand(-10,10),rand(8,16),false,hitAng,'red');
+            if(f.hp<=0) killFriendly(f,hitAng);
+            break;
+          }
+        }
+      }
+      if(hitFriendlyBot) continue;
+      if(!(dist(b.x,b.y,player.x,player.y)<player.r+4 && !player.dead)) continue;
+      const armor = clamp(player.armorProtection||0,0,.45);
+      const lethalFloor = (b.dmg >= 145) ? player.maxHp * .82 : player.maxHp * .58;
+      const realDmg = Math.max(lethalFloor, b.dmg * (1 - armor));
       player.hp -= realDmg; b.life=0; splatter(b.x,b.y,3); startCameraShake(player.hp > 0 ? 6 : 0,.24); playSound(soundPaths.hit,.45);
       const hitAng = Math.atan2(b.vy,b.vx);
       if(player.hp > 0){
@@ -3238,7 +5080,7 @@ function update(dt){
         splatter(player.x, player.y, 22, 1.55);
         sprayBloodToWall(player.x, player.y, hitAng + rand(-.5,.5), 115);
       }
-      if(player.hp<=0){ addBloodDecal(player.x + rand(-16,16), player.y + rand(-16,16), rand(28,46), false, hitAng); player.hp=0; player.dead=true; state='dead'; message=''; messageTimer=0; shake=0; playSound(soundPaths.death,.7); stopMusic(); beep(45,.4,.08,'sawtooth'); }
+      if(player.hp<=0){ awardArenaDeathReward(); addBloodDecal(player.x + rand(-16,16), player.y + rand(-16,16), rand(28,46), false, hitAng); player.hp=0; player.dead=true; state='dead'; if(selectedMissionKey!=='arena'){ message=''; messageTimer=0; } shake=0; playSound(soundPaths.death,.7); stopMusic(); beep(45,.4,.08,'sawtooth'); }
     }
   }
   if(player.bleedTime > 0 && !player.dead){
@@ -3298,6 +5140,8 @@ function update(dt){
 
   if(shells.length > 65) shells.splice(0, shells.length - 65);
   player.pickupText='';
+  updateDoorInteraction();
+  updateArenaAmmoBox();
   if(!player.pickupText){
     for(const p of pickups){
       const d=dist(player.x,player.y,p.x,p.y);
@@ -3318,9 +5162,16 @@ function update(dt){
   if(flashlightBlink > 0) flashlightBlink = Math.max(0, flashlightBlink - dt);
   else if(Math.random() < dt * .09) flashlightBlink = rand(.04,.12);
 
-  if(!missionComplete && enemies.length && enemies.every(e=>e.hp<=0)){
+  if(selectedMissionKey==='arena'){
+    updateArenaWaves(dt);
+  } else if(!missionComplete && enemies.length){
+    const partialPct = Math.floor((enemies.filter(e=>e.hp<=0).length / Math.max(1,enemies.length)) * 100);
+    if(partialPct>0) setMissionProgress(missionId, partialPct);
+  }
+  if(selectedMissionKey!=='arena' && !missionComplete && enemies.length && enemies.every(e=>e.hp<=0)){
     missionComplete = true;
     player.missionProgress[missionId] = 100;
+    setMissionProgress(missionId,100);
     saveProgress();
     saveAccountToSupabase();
     message = 'VYHRÁL SI';
@@ -3355,19 +5206,16 @@ function drawLoading(){
   ctx.strokeStyle='#000';
   ctx.lineWidth=10;
   ctx.fillStyle='#fff';
-  ctx.strokeText('PROJEKT SAS',W/2,230);
-  ctx.fillText('PROJEKT SAS',W/2,230);
-  const p = clamp(1 - loadingTimer/1.65, 0, 1);
+  ctx.strokeText('PROJEKT SAS',W/2,214);
+  ctx.fillText('PROJEKT SAS',W/2,214);
+  const p = preload.active || preload.done ? preload.progress : clamp(1 - loadingTimer/1.65, 0, 1);
   ctx.fillStyle='rgba(255,255,255,.12)';
-  ctx.fillRect(W/2-220,340,440,24);
+  ctx.fillRect(W/2-260,330,520,28);
   ctx.fillStyle='#d20b1c';
-  ctx.fillRect(W/2-220,340,440*p,24);
+  ctx.fillRect(W/2-260,330,520*p,28);
   ctx.strokeStyle='#fff';
   ctx.lineWidth=2;
-  ctx.strokeRect(W/2-220,340,440,24);
-  ctx.font='24px Impact';
-  ctx.fillStyle='#ddd';
-  ctx.fillText('LOADING...',W/2,395);
+  ctx.strokeRect(W/2-260,330,520,28);
   ctx.restore();
 }
 function drawNickWaiting(){
@@ -3383,10 +5231,16 @@ function drawNickWaiting(){
 function isOnScreen(x,y,margin=160){
   return x > camera.x-margin && x < camera.x+W+margin && y > camera.y-margin && y < camera.y+H+margin;
 }
+function rectOnScreen(r,margin=90){
+  return r && r.x+r.w > camera.x-margin && r.x < camera.x+W+margin && r.y+r.h > camera.y-margin && r.y < camera.y+H+margin;
+}
+function circleOnScreen(x,y,r=40,margin=90){
+  return x+r > camera.x-margin && x-r < camera.x+W+margin && y+r > camera.y-margin && y-r < camera.y+H+margin;
+}
 function draw(){
   ctx.save();
   ctx.clearRect(0,0,W,H);
-  if(state==='loading') drawLoading();
+  if(state==='loading' || state==='missionLoading') drawLoading();
   else if(state==='nick') drawNickWaiting();
   else if(state==='menu') drawMenu();
   else {
@@ -3396,28 +5250,33 @@ function draw(){
     drawWorld();
     drawShells();
     drawPickups();
-    if(gameMode==='lobby') drawLobbyCharacters();
-    else if(online.active) drawOnlinePlayers();
+    if(gameMode==='lobby'){ drawLobbyCharacters(); if(online.active) drawOnlinePlayers(); }
+    else { drawCompanion(); drawFriendlyBots(); if(online.active) drawOnlinePlayers(); }
     drawCameras();
+    drawChaosTurrets();
     drawTurrets();
     const deadCount = enemies.reduce((n,e)=>n+(e.hp<=0?1:0),0);
     corpseFastRender = deadCount > 14;
-    for(const e of enemies){ if(!isOnScreen(e.x,e.y,190)) continue; if(e.hp<=0 || playerSeesEnemy(e)) drawEnemy(e); }
+    for(const e of enemies){ if(!isOnScreen(e.x,e.y,190)) continue; if(e.hp<=0 || selectedMissionKey==='arena' || selectedMissionKey==='chaos' || playerSeesEnemy(e)) drawEnemy(e); }
     corpseFastRender = false;
     drawGrenades();
     drawBullets();
     drawExplosions();
-    drawParticles();
+    if(perfMode < 2) drawParticles();
     ctx.translate(camera.x - sx, camera.y - sy);
     drawLighting();
     drawExplorationFog();
     ctx.save();
     ctx.translate(-camera.x + sx, -camera.y + sy);
+    drawPet();
+    drawPlayerLaser();
     drawPlayer();
     if(gameMode==='lobby' && chatBubble.timer>0) drawWorldBubble(player.x,player.y-70,chatBubble.text,{maxChars:34,stroke:'#d20b1c'});
     ctx.restore();
     drawPlayerLabels();
     drawHUD();
+    drawMissionElevatorOverlay();
+    drawArenaLeaderboard();
     if(gameMode==='lobby'){ drawLobbyStatsBoard(); drawLobbyLeaderboard(); drawInventoryBar(); drawLobbyPrompts(); drawLobbyWindows(); }
     drawMessage();
     drawStoryOverlay();
@@ -3508,6 +5367,7 @@ function drawLobbyWorld(){
 
   drawWallShadows();
   for(const w of map.walls){
+    if(!rectOnScreen(w,120)) continue;
     const grad = ctx.createLinearGradient(w.x,w.y,w.x,w.y+w.h);
     grad.addColorStop(0,'#707070'); grad.addColorStop(.55,'#565656'); grad.addColorStop(1,'#383838');
     ctx.fillStyle=grad; ctx.fillRect(w.x,w.y,w.w,w.h);
@@ -3517,7 +5377,7 @@ function drawLobbyWorld(){
   }
   drawDoors();
   drawBulletMarks();
-  for(const d of map.decor) drawDecor(d);
+  for(const d of map.decor){ if(rectOnScreen(d,120)) drawDecor(d); }
 }
 
 function drawMissionFloorDetail(){
@@ -3551,9 +5411,10 @@ function drawWorld(){
   }
   ctx.fillStyle = textures.floor;
   ctx.fillRect(0,0,map.w,map.h);
-  drawMissionFloorDetail();
+  if(perfMode < 2) drawMissionFloorDetail();
 
   for(const r of roomVisuals){
+    if(!rectOnScreen(r,120)) continue;
     ctx.save();
     ctx.fillStyle = textures[r.floor] || textures.floor2;
     ctx.fillRect(r.x,r.y,r.w,r.h);
@@ -3561,7 +5422,7 @@ function drawWorld(){
     ctx.fillRect(r.x+10,r.y+10,Math.max(0,r.w-20),Math.max(0,r.h-20));
     ctx.strokeStyle='rgba(0,0,0,.28)'; ctx.lineWidth=3; ctx.strokeRect(r.x,r.y,r.w,r.h);
     // čistá podlaha bez šikmých čar
-    for(const rug of r.rugs||[]){
+    for(const rug of (perfMode<2 ? (r.rugs||[]) : [])){
       ctx.fillStyle = textures.rug; ctx.fillRect(rug.x,rug.y,rug.w,rug.h);
       ctx.fillStyle = rug.c; ctx.globalAlpha=.58; ctx.fillRect(rug.x,rug.y,rug.w,rug.h); ctx.globalAlpha=1;
       ctx.strokeStyle='rgba(0,0,0,.55)'; ctx.lineWidth=3; ctx.strokeRect(rug.x,rug.y,rug.w,rug.h);
@@ -3588,6 +5449,7 @@ drawWallShadows();
 
   // small lamp fixtures
   for(const l of ambientLights){
+    if(!circleOnScreen(l.x,l.y,60,80)) continue;
     ctx.fillStyle='rgba(20,20,20,.95)'; ctx.fillRect(l.x-10,l.y-10,20,20);
     ctx.strokeStyle='#000'; ctx.lineWidth=2; ctx.strokeRect(l.x-10,l.y-10,20,20);
     ctx.fillStyle='rgba(255,240,180,.22)'; ctx.beginPath(); ctx.arc(l.x,l.y,5,0,Math.PI*2); ctx.fill();
@@ -3597,7 +5459,7 @@ function drawWallShadows(){
   ctx.save();
   ctx.fillStyle='rgba(0,0,0,.28)';
   for(const w of map.walls){
-    if(w.w < 10 || w.h < 10) continue;
+    if(w.w < 10 || w.h < 10 || !rectOnScreen(w,140)) continue;
     ctx.fillRect(w.x+14,w.y+18,w.w,w.h);
   }
   ctx.restore();
@@ -3605,6 +5467,7 @@ function drawWallShadows(){
 function drawAlarmButtons(){
   if(gameMode!=='mission') return;
   for(const b of alarmButtons){
+    if(!circleOnScreen(b.x,b.y,32,80)) continue;
     const blink = b.flash>0 && Math.sin(performance.now()/75)>0;
     ctx.save();
     ctx.translate(b.x,b.y);
@@ -3627,6 +5490,7 @@ function drawAlarmBeacons(){
   if(gameMode!=='mission') return;
   const active = securityAlarm.timer>0 || alarmBeacons.some(l=>l.flash>0);
   for(const l of alarmBeacons){
+    if(!circleOnScreen(l.x,l.y,58,90)) continue;
     const blink = active && Math.sin(performance.now()/105)>0;
     ctx.save();
     ctx.translate(l.x,l.y);
@@ -3651,8 +5515,8 @@ function drawDecor(d){
   makeTextures();
   ctx.save();
 
-  if(d.t==='labelMission' || d.t==='labelLoadout'){
-    const txt = d.t==='labelMission' ? 'Mise' : 'Vybavení';
+  if(d.t==='labelMission' || d.t==='labelLoadout' || d.t==='labelShop' || d.t==='labelSkills' || d.t==='labelHazard' || d.t==='labelArena'){
+    const txt = d.t==='labelMission' ? 'Mise' : d.t==='labelLoadout' ? 'Výbava' : d.t==='labelShop' ? '' : d.t==='labelHazard' ? '' : d.t==='labelArena' ? 'Arena' : 'Skilly';
     ctx.font='24px Impact';
     ctx.textAlign='center';
     ctx.strokeStyle='#000';
@@ -3695,6 +5559,47 @@ function drawDecor(d){
     ctx.beginPath(); ctx.moveTo(d.x,d.y); ctx.lineTo(d.x+d.w,d.y+d.h); ctx.moveTo(d.x+d.w,d.y); ctx.lineTo(d.x,d.y+d.h); ctx.stroke();
     ctx.strokeStyle='rgba(255,210,140,.10)';
     for(let yy=d.y+10; yy<d.y+d.h; yy+=14){ ctx.beginPath(); ctx.moveTo(d.x+5,yy); ctx.lineTo(d.x+d.w-5,yy+rand(-2,2)); ctx.stroke(); }
+  } else if(d.t==='bars'){
+    ctx.fillStyle='rgba(0,0,0,.35)';
+    ctx.fillRect(d.x,d.y,d.w,d.h);
+    ctx.strokeStyle='#9a9a9a'; ctx.lineWidth=4;
+    for(let bx=d.x+8; bx<d.x+d.w; bx+=18){
+      ctx.beginPath(); ctx.moveTo(bx,d.y); ctx.lineTo(bx,d.y+d.h); ctx.stroke();
+    }
+    ctx.strokeStyle='#171717'; ctx.lineWidth=3; ctx.strokeRect(d.x,d.y,d.w,d.h);
+  } else if(d.t==='ammoBox'){
+    shadow();
+    ctx.fillStyle='#181818';
+    ctx.fillRect(d.x,d.y,d.w,d.h);
+    ctx.strokeStyle='#d20b1c';
+    ctx.lineWidth=4;
+    ctx.strokeRect(d.x,d.y,d.w,d.h);
+    ctx.fillStyle='#2b2b2b';
+    ctx.fillRect(d.x+10,d.y+12,d.w-20,18);
+    ctx.strokeStyle='#cfcfcf';
+    ctx.lineWidth=3;
+    for(let ax=d.x+22; ax<d.x+d.w-18; ax+=22){
+      ctx.beginPath(); ctx.moveTo(ax,d.y+42); ctx.lineTo(ax,d.y+60); ctx.stroke();
+    }
+    ctx.save();
+    ctx.font='22px Impact';
+    ctx.textAlign='center';
+    ctx.fillStyle='#fff';
+    ctx.strokeStyle='#000';
+    ctx.lineWidth=5;
+    ctx.strokeText('NÁBOJE',d.x+d.w/2,d.y-10);
+    ctx.fillText('NÁBOJE',d.x+d.w/2,d.y-10);
+    ctx.restore();
+  } else if(d.t==='elevatorCabin'){
+    ctx.fillStyle='rgba(0,0,0,.22)';
+    ctx.fillRect(d.x+8,d.y+10,d.w,d.h);
+    ctx.fillStyle='#101215'; ctx.fillRect(d.x,d.y,d.w,d.h);
+    ctx.strokeStyle='#050505'; ctx.lineWidth=4; ctx.strokeRect(d.x,d.y,d.w,d.h);
+    ctx.strokeStyle='rgba(255,255,255,.10)'; ctx.lineWidth=2; ctx.strokeRect(d.x+6,d.y+6,d.w-12,d.h-12);
+    ctx.fillStyle='rgba(255,255,255,.05)'; ctx.fillRect(d.x+14,d.y+14,d.w-28,d.h-58);
+    ctx.fillStyle='#262a31'; ctx.fillRect(d.x+18,d.y+d.h-34,d.w-36,18);
+    ctx.strokeStyle='rgba(210,11,28,.55)'; ctx.lineWidth=3;
+    ctx.beginPath(); ctx.moveTo(d.x+d.w/2,d.y+18); ctx.lineTo(d.x+d.w/2,d.y+d.h-38); ctx.stroke();
   } else if(d.t==='doorLight'){
     ctx.fillStyle='#101010'; ctx.fillRect(d.x,d.y,d.w,d.h);
     ctx.fillStyle='#d20b1c'; ctx.shadowColor='#d20b1c'; ctx.shadowBlur=10;
@@ -3765,6 +5670,7 @@ function drawShells(){
 }
 function drawDoors(){
   for(const d of map.doors){
+    if(!rectOnScreen(d,140)) continue;
     const panels = getDoorPanels(d);
     ctx.save();
     ctx.fillStyle='rgba(210,11,28,.18)'; ctx.fillRect(d.x,d.y,d.w,d.h);
@@ -3795,6 +5701,7 @@ function drawDoors(){
 }
 function drawBulletMarks(){
   for(const c of craters){
+    if(!circleOnScreen(c.x,c.y,c.r||50,80)) continue;
     ctx.save(); ctx.translate(c.x,c.y); ctx.rotate(c.a); ctx.scale(1.25,.82);
     const g=ctx.createRadialGradient(0,0,4,0,0,c.r);
     g.addColorStop(0,c.wall?'rgba(0,0,0,.92)':'rgba(6,6,6,.95)');
@@ -3808,6 +5715,7 @@ function drawBulletMarks(){
     ctx.restore();
   }
   for(const bd of bloodDecals){
+    if(!circleOnScreen(bd.x,bd.y,bd.size||30,80)) continue;
     ctx.save();
     ctx.translate(bd.x,bd.y);
     ctx.rotate(bd.a);
@@ -3875,6 +5783,7 @@ function drawBulletMarks(){
     ctx.restore();
   }
   for(const m of bulletMarks){
+    if(!circleOnScreen(m.x,m.y,m.size||8,70)) continue;
     ctx.save(); ctx.translate(m.x,m.y); ctx.rotate(m.a);
     ctx.fillStyle='rgba(0,0,0,.7)'; ctx.beginPath(); ctx.arc(0,0,m.size,0,Math.PI*2); ctx.fill();
     ctx.strokeStyle='rgba(255,255,255,.13)'; ctx.lineWidth=1;
@@ -3894,6 +5803,20 @@ function drawPickups(){
     else { ctx.beginPath(); ctx.moveTo(-8,0); ctx.lineTo(8,0); ctx.moveTo(0,-8); ctx.lineTo(0,8); ctx.stroke(); }
     ctx.restore();
   }
+}
+function drawPlayerLaser(){
+  if(!hasGear('laser') || player.laserOn === false || !player.weaponType || player.weaponType==='grenade' || player.dead) return;
+  const def = weaponDefs[player.weaponType] || weaponDefs.m4;
+  const mp = safeMuzzlePoint(player.x,player.y,player.ang,def.muzzleDist || 64);
+  const hit = castLightDistance(mp.x,mp.y,player.ang,900);
+  const ex = mp.x + Math.cos(player.ang)*hit;
+  const ey = mp.y + Math.sin(player.ang)*hit;
+  ctx.save(); ctx.globalCompositeOperation='lighter';
+  ctx.strokeStyle='rgba(165,0,0,.92)'; ctx.lineWidth=1.05; ctx.shadowColor='rgba(140,0,0,.72)'; ctx.shadowBlur=4;
+  ctx.beginPath(); ctx.moveTo(mp.x,mp.y); ctx.lineTo(ex,ey); ctx.stroke();
+  ctx.strokeStyle='rgba(120,0,0,.22)'; ctx.lineWidth=2.4; ctx.beginPath(); ctx.moveTo(mp.x,mp.y); ctx.lineTo(ex,ey); ctx.stroke();
+  ctx.fillStyle='rgba(170,0,0,.95)'; ctx.beginPath(); ctx.arc(ex,ey,2.4,0,Math.PI*2); ctx.fill();
+  ctx.restore();
 }
 function drawPlayer(){
   ctx.save();
@@ -3991,7 +5914,6 @@ function drawEnemy(e){
   const ready = enemySpritesReady[si] || enemySpritesReady[0];
   if(ready && img){
     ctx.imageSmoothingEnabled = true;
-    try { ctx.imageSmoothingQuality = 'high'; } catch(e2) {}
     ctx.filter = e.hp > 0 ? 'brightness(1.18) contrast(1.05)' : 'grayscale(1) brightness(0.11) contrast(1.12)';
     ctx.drawImage(img, -74, -74, 148, 148);
     ctx.filter = 'none';
@@ -4040,7 +5962,7 @@ function drawEnemy(e){
 
   if(e.hp > 0){
     ctx.rotate(Math.PI/2 - e.ang - drot);
-    const bw = 64, bh = 8;
+    const bw = 64, bh = 8; // Enemy bar is fixed. Player HP upgrades must not resize enemy HP.
     const hpw = bw*(e.hp/e.maxHp);
     ctx.fillStyle='#111'; ctx.fillRect(-bw/2,-62,bw,bh);
     ctx.fillStyle='#d20b1c'; ctx.fillRect(-bw/2,-62,hpw,bh);
@@ -4084,7 +6006,7 @@ function drawExplosions(){
 function drawBullets(){
   ctx.save(); ctx.lineCap='round';
   for(const b of bullets){
-    ctx.strokeStyle=b.owner==='p'?'#f3f3f3':'#d20b1c'; ctx.lineWidth=b.owner==='p'?3:2;
+    ctx.strokeStyle=(b.owner==='p'||b.owner==='a')?'#f3f3f3':'#d20b1c'; ctx.lineWidth=(b.owner==='p'||b.owner==='a')?3:2;
     ctx.beginPath(); ctx.moveTo(b.px,b.py); ctx.lineTo(b.x,b.y); ctx.stroke();
   }
   ctx.restore();
@@ -4173,9 +6095,10 @@ function drawLighting(){
       if(!op || op.gameMode !== gameMode || Date.now() - (op.lastSeen||0) > 6000) continue;
       const ox = Number.isFinite(op.rx) ? op.rx : op.x;
       const oy = Number.isFinite(op.ry) ? op.ry : op.y;
+      if(!circleOnScreen(ox,oy,760,120)) continue;
       const oa = op.ang || 0;
       const sx = ox - camera.x, sy = oy - camera.y;
-      const oLen = 690, oWidth = .44, rc = 26;
+      const oLen = 610, oWidth = .42, rc = 12;
       const oPts = [];
       for(let i=0;i<=rc;i++){
         const ra = oa-oWidth+(i/rc)*oWidth*2;
@@ -4308,7 +6231,7 @@ function drawLighting(){
 }
 function drawPlayerLabels(){
   const level = player.level;
-  const bw = 64, bh = 8;
+  const bw = clamp(64 + (player.maxHp-60)*.42,64,132), bh = 8;
   const x = player.x - bw/2 - camera.x;
   const y = player.y - 62 - camera.y;
   ctx.save();
@@ -4337,7 +6260,7 @@ function drawPlayerLabels(){
 }
 
 function drawInventoryBar(){
-  if(state!=='play') return;
+  if(state!=='play' || (gameMode==='lobby' && lobbyUi)) return;
   const size=78, gap=18, x=W/2 - size - gap/2, y=H-104;
   ctx.save();
   ctx.textAlign='center';
@@ -4369,22 +6292,18 @@ function drawInventoryBar(){
       ctx.fillText('+',sx+size/2,y+48);
     }
   }
-  ctx.font='12px Arial Black'; ctx.fillStyle='rgba(255,255,255,.55)';
-  ctx.fillText('+ / Ě PŘEPNOUT',W/2,y-12);
   ctx.restore();
 }
 function drawHUD(){
   ctx.save();
-  // levý horní roh: zásobník + počet kulí
   ctx.fillStyle='rgba(0,0,0,.9)'; ctx.strokeStyle='#d20b1c'; ctx.lineWidth=3;
   ctx.fillRect(18,18,170,64); ctx.strokeRect(18,18,170,64);
-  // jednoduchá ikonka zásobníku
   ctx.fillStyle='#1b1b1b'; ctx.strokeStyle='#bdbdbd'; ctx.lineWidth=2;
   ctx.beginPath();
   ctx.moveTo(34,28); ctx.lineTo(64,28); ctx.lineTo(70,62); ctx.lineTo(40,62); ctx.closePath();
   ctx.fill(); ctx.stroke();
   ctx.fillStyle='#444'; ctx.fillRect(45,62,12,8);
-  const ammoNow = player.weaponType==='grenade' ? String(player.ammo) : String(player.ammo);
+  const ammoNow = String(player.ammo);
   const ammoRes = player.weaponType==='grenade' ? 'ks' : ('/ ' + String(player.reserve));
   ctx.font='26px Impact'; ctx.fillStyle='#fff';
   ctx.fillText(ammoNow, 88, 48);
@@ -4392,15 +6311,20 @@ function drawHUD(){
   ctx.fillText(ammoRes, 120, 48);
   ctx.font='12px Arial'; ctx.fillStyle='rgba(255,255,255,.6)';
   ctx.fillText('AMMO', 88, 66);
+
+  ctx.fillStyle='rgba(20,0,0,.92)'; ctx.strokeStyle='#d20b1c'; ctx.lineWidth=3;
+  ctx.fillRect(18,88,170,34); ctx.strokeRect(18,88,170,34);
+  ctx.font='18px Impact'; ctx.fillStyle='#fff';
+  ctx.fillText('TOKENY  ' + availableTokens(), 34, 111);
+
   if(player.pickupText){
     ctx.font='24px Impact'; ctx.textAlign='center'; ctx.fillStyle='#fff'; ctx.strokeStyle='#000'; ctx.lineWidth=5;
-    ctx.strokeText(player.pickupText,W/2,H-92); ctx.fillText(player.pickupText,W/2,H-92);
+    ctx.strokeText(player.pickupText,W/2,H-126); ctx.fillText(player.pickupText,W/2,H-126);
     ctx.textAlign='left';
   }
-  // main menu ponechat
   ctx.fillStyle='rgba(0,0,0,.9)'; ctx.strokeStyle='#d20b1c'; ctx.lineWidth=4;
-  ctx.fillRect(1090,8,150,42); ctx.strokeRect(1090,8,150,42);
-  ctx.font='24px Impact'; ctx.fillStyle='#fff'; ctx.fillText('MAIN MENU',1110,37);
+  ctx.fillRect(W-170,14,150,40); ctx.strokeRect(W-170,14,150,40);
+  ctx.font='22px Impact'; ctx.fillStyle='#fff'; ctx.fillText('MENU',W-125,42);
 
   drawMinimap();
   drawInventoryBar();
@@ -4423,33 +6347,46 @@ function drawPortrait(){
   ctx.shadowBlur=0; ctx.strokeStyle='#505050'; ctx.lineWidth=3;
   ctx.beginPath(); ctx.moveTo(-22,-17); ctx.lineTo(-39,-30); ctx.moveTo(-22,17); ctx.lineTo(-38,31); ctx.stroke();
 }
+let minimapTimer = 0;
+let minimapCanvas = null;
 function drawMinimap(){
-  const mw=210,mh=132,x=W-mw-18,y=H-mh-18;
-  ctx.save();
-  ctx.fillStyle='rgba(0,0,0,.76)';
-  ctx.strokeStyle='rgba(210,11,28,.85)';
-  ctx.lineWidth=2;
-  ctx.fillRect(x,y,mw,mh);
-  ctx.strokeRect(x,y,mw,mh);
-  ctx.fillStyle='rgba(255,255,255,.03)';
-  ctx.fillRect(x+4,y+4,mw-8,mh-8);
+  const mw=188,mh=118,x=W-mw-18,y=H-mh-18;
   const sx=mw/map.w, sy=mh/map.h;
-
-  if(fog.seen.length){
-    for(let cy=0; cy<fog.rows; cy++){
-      for(let cx=0; cx<fog.cols; cx++){
-        if(!fog.seen[fogIndex(cx,cy)]) continue;
-        const wx = cx*fog.cell + fog.cell/2;
-        const wy = cy*fog.cell + fog.cell/2;
-        ctx.fillStyle = pointInWall(wx,wy) ? 'rgba(130,130,130,.75)' : 'rgba(42,42,42,.95)';
-        ctx.fillRect(x+cx*fog.cell*sx, y+cy*fog.cell*sy, Math.ceil(fog.cell*sx)+1, Math.ceil(fog.cell*sy)+1);
+  minimapTimer -= 1/60;
+  if(!minimapCanvas || minimapCanvas.width!==mw || minimapTimer<=0){
+    minimapTimer = .35;
+    minimapCanvas = document.createElement('canvas');
+    minimapCanvas.width = mw; minimapCanvas.height = mh;
+    const mctx = minimapCanvas.getContext('2d');
+    mctx.fillStyle='rgba(0,0,0,.76)';
+    mctx.fillRect(0,0,mw,mh);
+    mctx.fillStyle='rgba(255,255,255,.03)';
+    mctx.fillRect(4,4,mw-8,mh-8);
+    if(fog.seen.length){
+      mctx.fillStyle='rgba(42,42,42,.95)';
+      for(let cy=0; cy<fog.rows; cy++){
+        for(let cx=0; cx<fog.cols; cx++){
+          if(fog.seen[fogIndex(cx,cy)]) mctx.fillRect(cx*fog.cell*sx, cy*fog.cell*sy, Math.ceil(fog.cell*sx)+1, Math.ceil(fog.cell*sy)+1);
+        }
       }
     }
   }
+  ctx.save();
+  ctx.drawImage(minimapCanvas,x,y);
+  ctx.strokeStyle='rgba(210,11,28,.85)';
+  ctx.lineWidth=2;
+  ctx.strokeRect(x,y,mw,mh);
   ctx.strokeStyle='rgba(255,255,255,.16)';
   ctx.lineWidth=1;
   ctx.strokeRect(x+camera.x*sx,y+camera.y*sy,W*sx,H*sy);
-
+  if(selectedMissionKey==='arena'){
+    ctx.fillStyle='rgba(255,224,80,.95)';
+    for(const e of enemies){
+      if(e.hp>0){
+        ctx.beginPath(); ctx.arc(x+e.x*sx,y+e.y*sy,2.4,0,Math.PI*2); ctx.fill();
+      }
+    }
+  }
   ctx.fillStyle='#ff2a2a';
   ctx.beginPath(); ctx.arc(x+player.x*sx,y+player.y*sy,3.2,0,Math.PI*2); ctx.fill();
   ctx.font='9px Arial Black'; ctx.fillStyle='rgba(255,255,255,.62)';
@@ -4482,6 +6419,11 @@ function drawDead(){
   const xpTxt = player.level >= 10 ? 'XP MAX' : ('XP ' + player.levelXp + '/' + player.nextLevelXp);
   const stat1 = 'SKÓRE: ' + player.score + '   KILLY: ' + player.kills;
   const stat2 = 'CELKEM KILLŮ: ' + player.totalKills + '   LVL ' + player.level + '   ' + xpTxt;
+  if(selectedMissionKey==='arena'){
+    const rewardTxt = 'ARENA VLNA: ' + Math.max(0,wave|0) + '   ODMĚNA: +' + (arenaLastReward|0) + ' TOKEN';
+    ctx.strokeText(rewardTxt,W/2,255);
+    ctx.fillText(rewardTxt,W/2,255);
+  }
   ctx.strokeText(stat1,W/2,290);
   ctx.fillText(stat1,W/2,290);
   ctx.strokeText(stat2,W/2,325);
@@ -4549,7 +6491,11 @@ function drawButton(x,y,w,h,text,active){
 }
 
 function loop(now){
-  const dt = Math.min(.04,(now-last)/1000); last=now;
+  const rawDt = Math.max(0,(now-last)/1000); last=now;
+  if(rawDt > .030) slowFrameScore++; else slowFrameScore = Math.max(0, slowFrameScore-.7);
+  if(slowFrameScore > 10) perfMode = 1;
+  if(slowFrameScore > 24) perfMode = 2;
+  const dt = Math.min(.04,rawDt);
   toWorld(); update(dt); draw();
 }
 
@@ -4579,10 +6525,50 @@ function menuClick(x,y){
     }
   } else if(state==='dead'){
     if(inb(W/2-125,370,250,58)){ resetGame(); state='play'; }
-    if(inb(W/2-125,445,250,58)){ state='menu'; menuStep='main'; }
+    if(inb(W/2-125,445,250,58)){ closeOnlineRoom('HOST ODEŠEL'); state='menu'; menuStep='main'; }
   } else if(state==='play'){
     if(gameMode==='lobby' && lobbyUi){
-      if(lobbyUi==='missions' && inb(W/2-205,280,410,64)){ initAudio(); if(!online.active || online.isHost) startMissionFromLobby(); else { message='ČEKÁM NA HOSTA'; messageTimer=1.2; } return; }
+      if(lobbyUi==='missions' && inb(W/2-260,210,520,60)){ setSelectedMission('cerny_sklad'); initAudio(); if(!online.active || online.isHost) startMissionFromLobby(); else { message='ČEKÁM NA HOSTA'; messageTimer=1.2; } return; }
+      if(lobbyUi==='missions' && inb(W/2-260,290,520,60)){ setSelectedMission('vlak'); initAudio(); if(!online.active || online.isHost) startMissionFromLobby(); else { message='ČEKÁM NA HOSTA'; messageTimer=1.2; } return; }
+      if(lobbyUi==='missions' && inb(W/2-260,370,520,60)){ setSelectedMission('vytah'); initAudio(); if(!online.active || online.isHost) startMissionFromLobby(); else { message='ČEKÁM NA HOSTA'; messageTimer=1.2; } return; }
+      if(lobbyUi==='arena'){
+        if(inb(W/2-170,300,140,54)){
+          if(arenaConfirmStep===1){ arenaConfirmStep = 2; return; }
+          setSelectedMission('arena');
+          initAudio();
+          if(!online.active || online.isHost) startMissionFromLobby();
+          else { message='ARENU SPOUŠTÍ HOST'; messageTimer=1.4; }
+          return;
+        }
+        if(inb(W/2+30,300,140,54)){ lobbyUi=null; arenaConfirmStep=0; return; }
+        if(inb(W/2-90,390,180,48)){ lobbyUi=null; arenaConfirmStep=0; return; }
+      }
+      if(lobbyUi==='daily'){
+        if(inb(W/2-110,310,220,58)){ claimDailyReward(); return; }
+        return;
+      }
+      if(lobbyUi==='pets'){
+        if(inb(W/2-130,310,260,58)){
+          if(hasInventoryItem('pet_basic')){ message='MAZLÍČEK UŽ JE V INVENTÁŘI'; messageTimer=1.2; return; }
+          if(!spendTokens(1)){ message='NEMÁŠ TOKEN'; messageTimer=1.2; return; }
+          addInventoryItem('pet_basic',1);
+          message='MAZLÍČEK KOUPEN';
+          messageTimer=1.3;
+          return;
+        }
+        if(inb(W/2-90,430,180,48)){ lobbyUi=null; return; }
+      }
+      if(lobbyUi==='events'){
+        const ev=chaosEventInfo();
+        if(inb(W/2-170,330,340,56)){
+          if(!ev.active){ message='EVENT JE TEĎ VYPNUTÝ'; messageTimer=1.4; return; }
+          setSelectedMission('chaos'); initAudio();
+          if(!online.active || online.isHost) startMissionFromLobby();
+          else { message='EVENT SPOUŠTÍ HOST'; messageTimer=1.4; }
+          return;
+        }
+        if(inb(W/2-90,470,180,48)){ lobbyUi=null; return; }
+      }
       if(lobbyUi==='shop'){
         for(const card of getCharacterStripRects()){
           const bx=card.x+38, by=card.y+258, bw=card.w-76, bh=34;
@@ -4595,11 +6581,28 @@ function menuClick(x,y){
             return;
           }
         }
-        if(inb(W/2-90,545,180,48)){ lobbyUi=null; return; }
+        if(inb(W/2-90,648,180,48)){ lobbyUi=null; return; }
+      }
+      if(lobbyUi==='skills'){
+        for(const b of getSkillButtonRects()){
+          if(inb(b.x,b.y,b.w,b.h)){ upgradeSkill(b.key); return; }
+        }
+        if(inb(W/2-90,648,180,48)){ lobbyUi=null; return; }
+      }
+      if(lobbyUi==='inventory'){
+        for(const card of getInventoryCardRects()){
+          if(inb(card.x+8,card.y+card.h-24,card.w-16,18)){ dropInventoryItem(card.key); return; }
+          if(inb(card.x,card.y,card.w,card.h)){ useInventoryItem(card.key); return; }
+        }
+        if(inb(W/2-90,648,180,48) && !caseOpening.active){ lobbyUi=null; return; }
+      }
+      if(lobbyUi==='opening'){
+        if(inb(W/2-90,648,180,48) && !caseOpening.active){ lobbyUi=null; return; }
+        return;
       }
       if(lobbyUi==='loadout'){
-        if(inb(W/2-205,190,190,42)){ loadoutCategory='weapons'; return; }
-        if(inb(W/2+15,190,190,42)){ loadoutCategory='gear'; return; }
+        if(inb(W/2-205,145,190,42)){ loadoutCategory='weapons'; return; }
+        if(inb(W/2+15,145,190,42)){ loadoutCategory='gear'; return; }
         if(loadoutCategory==='weapons'){
           for(const card of getLoadoutCardRects()){
             if(inb(card.x, card.y, card.w, card.h)){
@@ -4617,11 +6620,11 @@ function menuClick(x,y){
             }
           }
         }
-        if(inb(W/2-90,545,180,48)){ lobbyUi=null; return; }
+        if(inb(W/2-90,648,180,48)){ lobbyUi=null; return; }
       }
-      if(inb(W/2-90,430,180,48)){ lobbyUi=null; return; }
+      if(inb(W/2-90,lobbyUi==='missions'?455:430,180,48)){ lobbyUi=null; return; }
     }
-    if(inb(1090,8,150,42)){ state='menu'; menuStep='main'; }
+    if(inb(1090,8,150,42)){ closeOnlineRoom('HOST ODEŠEL'); state='menu'; menuStep='main'; }
   }
 }
 
@@ -4638,9 +6641,25 @@ window.addEventListener('keydown', e=>{
     e.preventDefault();
     return;
   }
+  if(k==='f9'){ try{ window.open('cmd.html','_blank'); }catch(e){} e.preventDefault(); return; }
   if(k==='f10'){ openSupabaseEditor(); e.preventDefault(); return; }
+  if(k==='i' && state==='play'){
+    if(gameMode==='lobby' && !story.active){ lobbyUi = lobbyUi==='inventory' ? null : 'inventory'; }
+    else { message='INVENTÁŘ JEN V LOBBY'; messageTimer=1.0; }
+    e.preventDefault();
+    return;
+  }
   if(state==='play' && (k==='+' || k==='=' || e.code==='NumpadAdd' || k==='ě')){
+    if(gameMode==='lobby' && lobbyUi) lobbyUi = null;
     cycleInventory();
+    e.preventDefault();
+    return;
+  }
+  if(k==='g' && !keys.g && state==='play' && hasGear('laser')){
+    player.laserOn = player.laserOn === false;
+    saveProgress();
+    message = player.laserOn ? 'LASER ON' : 'LASER OFF';
+    messageTimer = .8;
     e.preventDefault();
     return;
   }
@@ -4657,7 +6676,15 @@ canvas.addEventListener('mousedown', e=>{
   menuClick((e.clientX-r.left)*sx,(e.clientY-r.top)*sy);
 });
 window.addEventListener('mouseup', ()=>mouse.down=false);
-canvas.addEventListener('contextmenu', e=>e.preventDefault());
+canvas.addEventListener('contextmenu', e=>{
+  e.preventDefault();
+  if(state==='play' && gameMode==='lobby' && lobbyUi==='inventory'){
+    const r=canvas.getBoundingClientRect(); const x=(e.clientX-r.left)*W/r.width, y=(e.clientY-r.top)*H/r.height;
+    for(const card of getInventoryCardRects()){
+      if(x>=card.x&&x<=card.x+card.w&&y>=card.y&&y<=card.y+card.h){ unequipInventoryItem(card.key); return; }
+    }
+  }
+});
 
 // basic touch support
 let touchFire=false;
@@ -4673,6 +6700,10 @@ canvas.addEventListener('touchend', e=>{ mouse.down=false; touchFire=false; },{p
 window.addEventListener('beforeunload', ()=>{
   saveProgress();
   try{
+    if(online.active && online.isHost && online.roomChannel){
+      try{ online.roomChannel.send({type:'broadcast',event:'hostClose',payload:{roomId:online.roomId,reason:'HOST ODEŠEL',t:Date.now()}}); }catch(e){}
+      deleteDbRoom();
+    }
     if(online.client && online.roomChannel) online.client.removeChannel(online.roomChannel);
     if(online.client && online.indexChannel) online.client.removeChannel(online.indexChannel);
   }catch(e){}
@@ -4704,10 +6735,19 @@ if(!localStorage.getItem('echo_noir_supabase_key')) localStorage.setItem('echo_n
 buildMap();
 makeTextures();
 resetFog();
+startPreload('game', ()=>{ loadingTimer = .28; playMusic(); cmdLog('BOOT','game preload finished');
+  const autoMission = localStorage.getItem('bullet_echo_autostart_mission');
+  if(autoMission && missionDefs[autoMission]){
+    localStorage.removeItem('bullet_echo_autostart_mission');
+    setSelectedMission(autoMission);
+    startMissionLoading(()=>{ gameMode='mission'; resetGame(); state='play'; });
+  }
+});
 requestAnimationFrame(loop);
 
 
 })();
+
 </script>
 </body>
 </html>

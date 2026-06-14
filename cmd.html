@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="cs">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>LukEngine CMD</title>
+<style>
+html,body{margin:0;background:#050505;color:#d7ffd7;font-family:Consolas,monospace;height:100%;overflow:hidden}
+#bar{height:44px;background:#111;border-bottom:1px solid #2a2a2a;display:flex;align-items:center;gap:10px;padding:0 12px;box-sizing:border-box}
+button{background:#111;color:#d7ffd7;border:1px solid #35a035;padding:6px 10px;font-family:Consolas,monospace;cursor:pointer}
+#status{padding:8px 12px;border-bottom:1px solid #222;color:#bff}
+#log{height:calc(100% - 92px);overflow:auto;padding:10px 12px;box-sizing:border-box;white-space:pre-wrap;font-size:13px;line-height:1.35}
+.err{color:#ff7777}.warn{color:#ffd56c}.ok{color:#78ff78}.info{color:#cfcfcf}.sys{color:#8fd0ff}
+</style>
+</head>
+<body>
+<div id="bar">
+  <b>LukEngine CMD</b>
+  <button onclick="clearLogs()">clear</button>
+  <button onclick="copyLogs()">copy</button>
+  <button onclick="location.reload()">reload</button>
+</div>
+<div id="status">čekám na hru...</div>
+<div id="log"></div>
+<script>
+const KEY='lukengine_cmd_logs_v1';
+const statusEl=document.getElementById('status');
+const logEl=document.getElementById('log');
+let logs=[];
+function cls(type){
+  type=String(type||'').toUpperCase();
+  if(type.includes('ERR')||type.includes('PROMISE')) return 'err';
+  if(type.includes('WARN')||type.includes('LOAD_ERR')) return 'warn';
+  if(type.includes('LOAD')||type.includes('PRELOAD')) return 'ok';
+  if(type.includes('ONLINE')||type.includes('DB')) return 'sys';
+  return 'info';
+}
+function read(){
+  try{logs=JSON.parse(localStorage.getItem(KEY)||'[]')}catch(e){logs=[]}
+}
+function render(){
+  logEl.innerHTML=logs.map(e=>{
+    const data=e.data?(' '+safe(JSON.stringify(e.data)).slice(0,700)):'';
+    return `<div class="${cls(e.type)}">[${safe(e.t||'')}] ${safe(e.type||'INFO')} &gt; ${safe(e.msg||'')}${data}</div>`;
+  }).join('');
+  logEl.scrollTop=logEl.scrollHeight;
+}
+function safe(s){return String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]))}
+function refreshStatus(){
+  try{
+    const s=JSON.parse(localStorage.getItem('lukengine_status')||'{}');
+    statusEl.textContent='STATE '+(s.state||'?')+' | MODE '+(s.gameMode||'?')+' | ONLINE '+(s.online&&s.online.status||'?')+' | ROOM '+(s.online&&s.online.roomCode||'-')+' | ENEMY '+(s.counts&&s.counts.enemies||0)+' | SHELL '+(s.counts&&s.counts.shells||0)+' | LOAD '+(s.preload&&s.preload.progress||0)+'%';
+  }catch(e){}
+}
+function clearLogs(){localStorage.setItem(KEY,'[]');logs=[];render()}
+function copyLogs(){navigator.clipboard&&navigator.clipboard.writeText(logEl.innerText)}
+read();render();refreshStatus();
+setInterval(()=>{read();render();refreshStatus()},1000);
+try{
+  const ch=new BroadcastChannel('lukengine_cmd');
+  ch.onmessage=e=>{
+    if(e.data&&e.data.status){refreshStatus();return}
+    if(e.data&&e.data.msg){logs.push(e.data);while(logs.length>260)logs.shift();render();}
+  };
+}catch(e){}
+</script>
+</body>
+</html>
