@@ -365,34 +365,53 @@ function ensureOnlineClient(){
   online.lastStatus = 'ONLINE';
   return true;
 }
+function rememberOnlineRoom(room){
+  if(!room || !room.roomId) return;
+  if(Date.now() - (room.ts || 0) > 15000) return;
+  const map = new Map();
+  for(const r of online.rooms || []){
+    if(r && r.roomId && Date.now() - (r.ts || 0) <= 15000) map.set(r.roomId, r);
+  }
+  map.set(room.roomId, room);
+  online.rooms = [...map.values()].filter(r=>!r.started).sort((a,b)=>(b.ts||0)-(a.ts||0));
+}
 function syncOnlineRooms(){
   if(!online.indexChannel) return;
   const st = online.indexChannel.presenceState();
-  const rooms = [];
+  const map = new Map();
+  for(const r of online.rooms || []){
+    if(r && r.roomId && Date.now() - (r.ts || 0) <= 15000) map.set(r.roomId, r);
+  }
   for(const arr of Object.values(st)){
     for(const p of arr){
       if(!p || p.type !== 'room') continue;
-      if(Date.now() - (p.ts || 0) > 12000) continue;
-      rooms.push(p);
+      if(Date.now() - (p.ts || 0) > 15000) continue;
+      map.set(p.roomId, p);
     }
   }
-  const map = new Map();
-  for(const r of rooms) map.set(r.roomId, r);
-  online.rooms = [...map.values()].filter(r=>!r.started);
+  online.rooms = [...map.values()].filter(r=>!r.started).sort((a,b)=>(b.ts||0)-(a.ts||0));
 }
 function subscribeOnlineIndex(trackSelf=false){
   if(!ensureOnlineClient()) return false;
-  if(online.indexChannel) return true;
+  if(online.indexChannel){
+    if(trackSelf && online.isHost) trackOnlineRoom();
+    else if(online.searching){ try{ online.indexChannel.track({type:'searcher',id:online.clientId,name:online.playerName,ts:Date.now()}); }catch(e){} }
+    return true;
+  }
   online.indexChannel = online.client.channel(ONLINE_INDEX_CHANNEL, {
-    config:{ presence:{ key:online.clientId } }
+    config:{ broadcast:{self:false,ack:false}, presence:{ key:online.clientId } }
   });
   online.indexChannel
+    .on('broadcast',{event:'roomAnnounce'},payload=>{
+      rememberOnlineRoom(payload.payload || {});
+    })
     .on('presence',{event:'sync'},()=>syncOnlineRooms())
     .subscribe(async status=>{
       online.lastStatus = status;
       if(status === 'SUBSCRIBED'){
         if(trackSelf && online.isHost) trackOnlineRoom();
         else await online.indexChannel.track({type:'searcher',id:online.clientId,name:online.playerName,ts:Date.now()});
+        syncOnlineRooms();
       }
     });
   return true;
@@ -400,15 +419,48 @@ function subscribeOnlineIndex(trackSelf=false){
 async function trackOnlineRoom(){
   if(!online.indexChannel || !online.isHost || !online.roomId) return;
   const players = 1 + Object.keys(online.remotePlayers).length;
-  await online.indexChannel.track({
+  const room = {
     type:'room',
     roomId:online.roomId,
     code:online.roomCode,
-    host:online.playerName,
+    host:online.playerName || getPlayerNick() || 'HOST',
     players,
     started:gameMode==='mission',
     ts:Date.now()
-  });
+  };
+  rememberOnlineRoom(room);
+  try{ await online.indexChannel.track(room); }catch(e){}
+  try{ await online.indexChannel.send({type:'broadcast',event:'roomAnnounce',payload:room}); }catch(e){}
+  upsertDbRoom(room);
+}
+
+
+async function upsertDbRoom(room){
+  try{
+    if(!online.client || !room || !room.roomId) return;
+    await online.client.from('echo_noir_rooms').upsert({
+      room_id:room.roomId, code:room.code, host_id:online.clientId,
+      host_name:room.host, players:room.players|0, started:!!room.started,
+      updated_at:new Date().toISOString()
+    }, {onConflict:'room_id'});
+  }catch(e){}
+}
+async function fetchDbRooms(){
+  try{
+    if(!online.client) return;
+    const since = new Date(Date.now()-18000).toISOString();
+    const {data,error} = await online.client
+      .from('echo_noir_rooms')
+      .select('room_id,code,host_name,players,started,updated_at')
+      .eq('started',false)
+      .gt('updated_at',since)
+      .order('updated_at',{ascending:false})
+      .limit(10);
+    if(error || !Array.isArray(data)) return;
+    for(const r of data){
+      rememberOnlineRoom({type:'room',roomId:r.room_id,code:r.code,host:r.host_name,players:r.players,started:r.started,ts:new Date(r.updated_at).getTime()});
+    }
+  }catch(e){}
 }
 function createOnlineRoom(){
   if(!ensureOnlineClient()) return false;
@@ -419,7 +471,10 @@ function createOnlineRoom(){
   online.roomCode = online.roomId.slice(-4).toUpperCase();
   online.remotePlayers = {};
   setupOnlineRoomChannel();
+  online.lastIndexTrack = 0;
   subscribeOnlineIndex(true);
+  setTimeout(()=>trackOnlineRoom(),180);
+  setTimeout(()=>trackOnlineRoom(),850);
   enterLobby();
   message = 'ONLINE LOBBY ' + online.roomCode;
   messageTimer = 2;
@@ -433,7 +488,11 @@ function openOnlineSearch(){
   online.roomId = null;
   online.roomCode = null;
   online.remotePlayers = {};
+  online.rooms = [];
+  online.lastIndexTrack = 0;
   subscribeOnlineIndex(false);
+  setTimeout(()=>syncOnlineRooms(),250);
+  setTimeout(()=>fetchDbRooms(),450);
   menuStep = 'online_search';
   return true;
 }
@@ -501,6 +560,7 @@ function sendOnlineState(force=false){
     x:player.x,y:player.y,ang:player.ang,
     walk:player.walk,moving:player.moving,
     hp:player.hp,maxHp:player.maxHp,dead:player.dead,
+    chatText:chatBubble.timer>0?chatBubble.text:'',chatUntil:chatBubble.timer>0?Date.now()+Math.max(400,chatBubble.timer*1000):0,
     gameMode,weaponType:player.weaponType,characterKey:player.characterKey,
     level:player.level,kills:player.kills,totalKills:player.totalKills,
     t:Date.now()
@@ -509,9 +569,15 @@ function sendOnlineState(force=false){
 }
 function onlineTick(dt){
   if(online.isHost && online.indexChannel && online.roomId){
-    if(performance.now() - online.lastIndexTrack > 1800){
+    if(performance.now() - online.lastIndexTrack > 750){
       online.lastIndexTrack = performance.now();
       trackOnlineRoom();
+    }
+  } else if(online.searching && online.indexChannel){
+    if(performance.now() - online.lastIndexTrack > 1200){
+      online.lastIndexTrack = performance.now();
+      syncOnlineRooms();
+      fetchDbRooms();
     }
   }
   if(online.active) sendOnlineState(false);
@@ -660,7 +726,7 @@ const loadoutDefs = {
     sound: soundPaths.weapons.shotgun
   }
 };
-const loadoutOrder = ['m4','sniper','lmg','shotgun'];
+const loadoutOrder = ['m4','sniper','lmg','shotgun','grenade'];
 loadoutOrder.forEach(key => {
   const d = loadoutDefs[key];
   d.img = new Image();
@@ -677,7 +743,7 @@ const equipmentDefs = {
   gloves:{key:'gloves',name:'Rukavice',slot:'ruce',hp:4,armor:.02,desc:'+4 HP, jistější úchop'},
   pants:{key:'pants',name:'Kalhoty',slot:'nohy',hp:7,armor:.035,desc:'+7 HP, lehká ochrana'}
 };
-const equipmentOrder = [];
+const equipmentOrder = ['vest','helmet','boots','gloves','pants'];
 const characterDefs = {
   zlaty: {
     key:'zlaty',
@@ -842,7 +908,7 @@ function createEnemyAt(x,y,zone=null,kind=null){
     lastSeenX:x, lastSeenY:y, investigateX:x, investigateY:y,
     strafeDir:Math.random()<.5?-1:1, flashPhase:rand(0,Math.PI*2),
     buttonTarget:null, buttonTried:false, searchMapTimer:0,
-    bloodColor: (spriteIndex===2) ? 'yellow' : 'red',
+    bloodColor: (spriteIndex===0 || kind==='mirror') ? 'yellow' : 'red',
     blood:[], corpseAnim:0, corpseAnimMax:.24, corpseDX:0, corpseDY:0, corpseRot:0,
     bleedTime:0, bleedNext:0
   });
@@ -1036,15 +1102,9 @@ function buildMap(){
   ];
   for(const d of doorCandidates){ if(Math.random() < .82) door(d[0],d[1],d[2],d[3]); }
 
-  // tlačítka jsou na zdi u hlavních vchodů, ne uprostřed podlahy
+  // tlačítka jsou na zdi u vchodů, ne uprostřed podlahy
   alarmButton(125,650,0);
-  alarmButton(790,410,Math.PI);
-  alarmButton(1450,375,Math.PI);
-  alarmButton(2130,720,-Math.PI/2);
-  alarmButton(1020,1020,-Math.PI/2);
-  alarmButton(2070,1020,-Math.PI/2);
-  alarmButton(1070,1660,-Math.PI/2);
-  alarmButton(2050,1660,-Math.PI/2);
+  alarmButton(2380,1020,Math.PI/2);
 
   alarmBeacon(240,110);
   alarmBeacon(1110,110);
@@ -1318,8 +1378,8 @@ function drawShopkeeper(){
 }
 function initLobbyTargets(){
   lobbyTargets.length = 0;
-  lobbyTargets.push({name:'FIGURÍNA',x:lobbyData.targetA.x,y:lobbyData.targetA.y,ang:lobbyData.targetA.ang,r:20,hp:80,maxHp:80,spriteIndex:0,state:'idle',bloodColor:'red',blood:[],respawn:0,muzzleFx:0});
-  lobbyTargets.push({name:'ČERNÝ TERČ',x:lobbyData.targetB.x,y:lobbyData.targetB.y,ang:lobbyData.targetB.ang,r:20,hp:105,maxHp:105,spriteIndex:2,state:'idle',bloodColor:'yellow',blood:[],respawn:0,muzzleFx:0});
+  lobbyTargets.push({name:'FIGURÍNA',x:lobbyData.targetA.x,y:lobbyData.targetA.y,ang:lobbyData.targetA.ang,r:20,hp:80,maxHp:80,spriteIndex:0,state:'idle',bloodColor:'yellow',blood:[],respawn:0,muzzleFx:0});
+  lobbyTargets.push({name:'ČERNÝ TERČ',x:lobbyData.targetB.x,y:lobbyData.targetB.y,ang:lobbyData.targetB.ang,r:20,hp:105,maxHp:105,spriteIndex:2,state:'idle',bloodColor:'red',blood:[],respawn:0,muzzleFx:0});
 }
 function updateLobbyTargets(dt){
   for(const t of lobbyTargets){
@@ -1334,7 +1394,7 @@ function updateLobbyTargets(dt){
 function hitLobbyTarget(t,b){
   if(!t || t.hp<=0) return;
   const a=Math.atan2(b.vy,b.vx);
-  const col=t.bloodColor || (t.spriteIndex===2?'yellow':'red');
+  const col=t.bloodColor || (t.spriteIndex===0?'yellow':'red');
   t.hp -= b.dmg;
   for(let i=0;i<5;i++) t.blood.push({x:rand(-18,18),y:rand(-18,18),r:rand(4,10),a:rand(-Math.PI,Math.PI),s:rand(.8,1.6),color:col});
   if(t.blood.length>28) t.blood.splice(0,t.blood.length-28);
@@ -1727,10 +1787,6 @@ function drawLobbyWindows(){
       cards.forEach(card => drawLoadoutCard(card, player.loadoutSlots.includes(card.key)));
     } else {
       const cards = getEquipmentCardRects();
-      if(!cards.length){
-        ctx.font='26px Impact'; ctx.fillStyle='rgba(255,255,255,.55)';
-        ctx.fillText('PRÁZDNÉ',W/2,350);
-      }
       cards.forEach(card => drawEquipmentCard(card));
     }
   }
@@ -1771,37 +1827,26 @@ function saveProgress(){
     }));
   }catch(e){}
 }
-function sanitizeInventorySave(){
-  const valid = ['m4','sniper','lmg','shotgun'];
-  if(!Array.isArray(player.loadoutSlots)) player.loadoutSlots = ['m4', null];
-  player.loadoutSlots = [player.loadoutSlots[0], player.loadoutSlots[1]].map(k => valid.includes(k) ? k : null);
-  if(!player.loadoutSlots[0] && !player.loadoutSlots[1]) player.loadoutSlots[0] = 'm4';
-  player.selectedSlot = clamp(player.selectedSlot|0,0,1);
-  if(!player.loadoutSlots[player.selectedSlot]) player.selectedSlot = player.loadoutSlots[0] ? 0 : 1;
-  if(!valid.includes(player.weaponType)) player.weaponType = player.loadoutSlots[player.selectedSlot] || player.loadoutSlots[0] || 'm4';
-  player.slotTroll = [!!(player.slotTroll&&player.slotTroll[0]), !!(player.slotTroll&&player.slotTroll[1])];
-  player.equippedGear = {};
-  for(const k of Object.keys(player.weaponState||{})) if(!valid.includes(k)) delete player.weaponState[k];
-}
 function loadProgress(){
   try{
     const raw = localStorage.getItem(SAVE_KEY);
-    if(!raw){ sanitizeInventorySave(); return; }
+    if(!raw) return;
     const data = JSON.parse(raw);
     if(Number.isFinite(data.totalKills)) player.totalKills = Math.max(0, data.totalKills|0);
     if(Number.isFinite(data.totalXp)) player.totalXp = Math.max(0, data.totalXp|0);
-    if(Array.isArray(data.loadoutSlots)) player.loadoutSlots = [data.loadoutSlots[0] || 'm4', data.loadoutSlots[1] || null];
+    if(Array.isArray(data.loadoutSlots)) player.loadoutSlots = [data.loadoutSlots[0] || 'm4', data.loadoutSlots[1] || null].map(x=>weaponDefs[x]?x:null);
     if(Number.isFinite(data.selectedSlot)) player.selectedSlot = clamp(data.selectedSlot|0,0,1);
     if(data.weaponState && typeof data.weaponState === 'object') player.weaponState = data.weaponState;
     if(Array.isArray(data.slotTroll)) player.slotTroll = [!!data.slotTroll[0], !!data.slotTroll[1]];
-    player.equippedGear = {};
+    if(data.equippedGear && typeof data.equippedGear === 'object') player.equippedGear = {...data.equippedGear};
     if(data.weaponType && weaponDefs[data.weaponType]) player.weaponType = data.weaponType;
-    sanitizeInventorySave();
+    if(!player.loadoutSlots[player.selectedSlot]) player.loadoutSlots[player.selectedSlot] = player.weaponType || 'm4';
+    if(player.loadoutSlots[player.selectedSlot] && weaponDefs[player.loadoutSlots[player.selectedSlot]]) player.weaponType = player.loadoutSlots[player.selectedSlot];
     player.trollSniper = !!player.slotTroll[player.selectedSlot];
     if(data.characterKey && characterDefs[data.characterKey]) player.characterKey = data.characterKey;
     if(data.missionProgress && typeof data.missionProgress === 'object') player.missionProgress = {...player.missionProgress, ...data.missionProgress};
     if(data.nick && !localStorage.getItem('echo_noir_player_nick')) localStorage.setItem('echo_noir_player_nick', data.nick);
-  }catch(e){ sanitizeInventorySave(); }
+  }catch(e){}
 }
 function getCurrentPlayerSpritePath(){
   if(player.characterKey === 'zlaty'){
@@ -1814,16 +1859,10 @@ function getCurrentPlayerSpritePath(){
 function updatePlayerSprite(){
   const spriteSrc = getCurrentPlayerSpritePath();
   currentPlayerSpriteSrc = spriteSrc;
-  const cached = getSpriteAssetFor(player.characterKey, player.weaponType);
-  if(cached && cached.ready && cached.img){
-    playerSpriteReady = true;
-    playerSprite.src = cached.img.src;
-  } else if(playerSprite.src !== spriteSrc){
-    playerSpriteReady = false;
-    playerSprite.src = spriteSrc;
-  }
-  enemySpritesReady[3] = !!(cached && cached.ready && cached.img);
-  enemySprites[3].src = (cached && cached.img && cached.img.src) ? cached.img.src : spriteSrc;
+  playerSpriteReady = false;
+  playerSprite.src = spriteSrc;
+  enemySpritesReady[3] = false;
+  enemySprites[3].src = spriteSrc;
 }
 function getSpriteAssetFor(characterKey, weaponType){
   if(characterKey === 'zlaty'){
@@ -1872,7 +1911,7 @@ function restoreWeaponState(key, refill=false){
   }
 }
 function applyLoadout(key, save=true, refill=false, troll=false){
-  const useKey = (weaponDefs[key] && key !== 'grenade') ? key : 'm4';
+  const useKey = weaponDefs[key] ? key : 'm4';
   snapshotWeaponState();
   player.selectedSlot = clamp(player.selectedSlot|0,0,1);
   player.loadoutSlots[player.selectedSlot] = useKey;
@@ -1886,7 +1925,7 @@ function applyLoadout(key, save=true, refill=false, troll=false){
 function switchInventorySlot(slot){
   slot = clamp(slot|0,0,1);
   const key = player.loadoutSlots[slot];
-  if(!key || !weaponDefs[key] || key==='grenade'){ message='PRÁZDNÝ SLOT'; messageTimer=.8; return false; }
+  if(!key || !weaponDefs[key]){ message='PRÁZDNÝ SLOT'; messageTimer=.8; return false; }
   snapshotWeaponState();
   player.selectedSlot = slot;
   player.weaponType = key;
@@ -1894,8 +1933,8 @@ function switchInventorySlot(slot){
   restoreWeaponState(key, false);
   updatePlayerSprite();
   saveProgress();
-  message = '';
-  messageTimer = 0;
+  message = weaponDefs[key].name;
+  messageTimer = .75;
   return true;
 }
 function cycleInventory(){
@@ -1903,7 +1942,7 @@ function cycleInventory(){
   if(!switchInventorySlot(next)) switchInventorySlot(player.selectedSlot);
 }
 function setInventoryWeaponFromLoadout(key){
-  if(!weaponDefs[key] || key==='grenade') return;
+  if(!weaponDefs[key]) return;
   snapshotWeaponState();
   let idx = player.loadoutSlots.indexOf(key);
   if(idx < 0){
@@ -1929,11 +1968,16 @@ function refillInventoryAmmo(){
   restoreWeaponState(player.weaponType||player.loadoutSlots[player.selectedSlot]||'m4', true);
 }
 function recalcEquipmentStats(){
-  player.equippedGear = {};
-  player.gearHpBonus = 0;
-  player.armorProtection = 0;
-  player.maxHp = 60;
+  const oldMax = player.maxHp || 60;
+  let hp=0, armor=0;
+  for(const key of equipmentOrder){
+    if(player.equippedGear && player.equippedGear[key]){ hp += equipmentDefs[key].hp||0; armor += equipmentDefs[key].armor||0; }
+  }
+  player.gearHpBonus = hp;
+  player.armorProtection = clamp(armor,0,.28);
+  player.maxHp = 60 + hp;
   if(player.hp > player.maxHp) player.hp = player.maxHp;
+  else if(player.hp > 0 && player.maxHp > oldMax) player.hp = Math.min(player.maxHp, player.hp + (player.maxHp-oldMax));
 }
 function toggleEquipment(key){
   if(!equipmentDefs[key]) return;
@@ -1973,7 +2017,6 @@ function grantXp(amount=1){
   }
 }
 loadProgress();
-sanitizeInventorySave();
 recalcEquipmentStats();
 online.playerName = getPlayerNick() || online.playerName || ('HRÁČ ' + online.clientId.slice(-4).toUpperCase());
 recalcPlayerLevel();
@@ -2017,7 +2060,7 @@ function resetGame(){
 }
 
 function spawnWave(){
-  const count = 16 + wave * 5;
+  const count = 12 + wave * 4;
   const modes = ['patrol','guard','idle','wander'];
   const placed = [];
   for(let i=0;i<count;i++){
@@ -2210,7 +2253,6 @@ function moveCircle(obj, vx, vy, dt){
   return Math.hypot(obj.x-ox,obj.y-oy) > .08;
 }
 function startCameraShake(power=8,dur=.22){
-  if(power >= 12) dur = Math.min(dur, 2.0);
   shake = Math.max(shake,power);
   shakeTimer = Math.max(shakeTimer,dur);
 }
@@ -2356,7 +2398,7 @@ function enemySeesPlayer(e){
 }
 function pushParticle(x,y,vx,vy,life,size,kind='spark'){
   particles.push({x,y,vx,vy,life,max:life,size,kind});
-  if(particles.length > 260) particles.splice(0, particles.length - 260);
+  if(particles.length > 180) particles.splice(0, particles.length - 180);
 }
 function splatter(x,y,n=8,power=1,color='red'){
   // Bez explozivního rozprsknutí krve. Krev řeší decals/louže a sprayBloodToWall.
@@ -2376,7 +2418,7 @@ function addBloodDecal(x,y,size=10,onWall=false,a=0,color='red'){
     drips:onWall ? 1+((Math.random()*3)|0) : ((Math.random()*3)|0),
     seed:Math.random()*1000
   });
-  if(bloodDecals.length > 210) bloodDecals.splice(0, bloodDecals.length - 210);
+  if(bloodDecals.length > 160) bloodDecals.splice(0, bloodDecals.length - 160);
 }
 function sprayBloodToWall(x,y,a,maxLen=90,color='red'){
   const step = 6;
@@ -2417,19 +2459,38 @@ function dropShell(x,y,a,power=1){
     size:rand(.85,1.25) * (.9 + power*.18)
   });
 
-  if(shells.length > 90) shells.splice(0, shells.length - 90);
+  if(shells.length > 65) shells.splice(0, shells.length - 65);
 }
 function addBulletMark(x,y,a){
   bulletMarks.push({x,y,a,size:rand(3.5,6.5)});
-  if(bulletMarks.length > 700) bulletMarks.shift();
+  if(bulletMarks.length > 420) bulletMarks.splice(0, bulletMarks.length - 420);
 }
 
+function safeMuzzlePoint(x,y,a,desired){
+  let lx = x + Math.cos(a)*10;
+  let ly = y + Math.sin(a)*10;
+  for(let d=12; d<=desired; d+=6){
+    const tx = x + Math.cos(a)*d;
+    const ty = y + Math.sin(a)*d;
+    if(pointInWall(tx,ty) || !los(x,y,tx,ty,2)) break;
+    lx = tx; ly = ty;
+  }
+  return {x:lx,y:ly};
+}
+function bulletSegmentHitsSolid(x1,y1,x2,y2){
+  let blocked = false;
+  eachSolidRect(r=>{
+    if(!blocked && segmentRectHit(x1,y1,x2,y2,3,r)) blocked = true;
+  });
+  return blocked;
+}
 function shoot(owner, x,y,a, dmg, speed, spread=.035){
   const isPlayer = owner === 'p';
   const def = isPlayer && player.weaponType ? weaponDefs[player.weaponType] : null;
   const muzzleDist = def ? def.muzzleDist : (isPlayer ? 58 : 24);
-  const bx = x + Math.cos(a)*muzzleDist;
-  const by = y + Math.sin(a)*muzzleDist;
+  const mp = safeMuzzlePoint(x,y,a,muzzleDist);
+  const bx = mp.x;
+  const by = mp.y;
   const pellets = def && def.pellets ? def.pellets : 1;
   for(let i=0;i<pellets;i++){
     const extra = pellets > 1 ? rand(-spread*0.95, spread*0.95) : 0;
@@ -2569,7 +2630,7 @@ function updatePlayerWeapon(dt, simDt){
     if(player.weaponType === 'sniper' && player.trollSniper){
       player.recoilVX -= Math.cos(player.ang)*980;
       player.recoilVY -= Math.sin(player.ang)*980;
-      startCameraShake(13,2.0);
+      startCameraShake(13,3.0);
       player.muzzleFx = .16;
     }
   }
@@ -2605,7 +2666,7 @@ function updateLooseFx(dt, simDt){
       }
       if(b.life<=0) continue;
     }
-    if(pointInWall(b.x,b.y)){
+    if(pointInWall(b.x,b.y) || bulletSegmentHitsSolid(b.px,b.py,b.x,b.y)){
       b.life = 0;
       const ba=Math.atan2(b.vy,b.vx);
       addBulletMark(b.x,b.y,ba);
@@ -3016,7 +3077,7 @@ function update(dt){
             const relY = Math.sin(localA) * rand(2,16) + rand(-14,14);
             e.blood.push({x:relX,y:relY,r:rand(4,10),a:rand(-Math.PI,Math.PI),s:rand(.8,1.7),color:e.bloodColor||'red'});
           }
-          if(e.blood.length > 54) e.blood.splice(0, e.blood.length - 54);
+          if(e.blood.length > 32) e.blood.splice(0, e.blood.length - 32);
 
           // hodně krve na zem i případně na stěnu
           addBloodDecal(e.x + rand(-10,10), e.y + rand(-10,10), rand(12,22), false, hitAng, bcol);
@@ -3122,7 +3183,7 @@ function update(dt){
     }
   }
 
-  if(shells.length > 90) shells.splice(0, shells.length - 90);
+  if(shells.length > 65) shells.splice(0, shells.length - 65);
   player.pickupText='';
   if(!player.pickupText){
     for(const p of pickups){
@@ -3206,6 +3267,9 @@ function drawNickWaiting(){
   ctx.fillText('ZADEJ NICK',W/2,260);
   ctx.restore();
 }
+function isOnScreen(x,y,margin=160){
+  return x > camera.x-margin && x < camera.x+W+margin && y > camera.y-margin && y < camera.y+H+margin;
+}
 function draw(){
   ctx.save();
   ctx.clearRect(0,0,W,H);
@@ -3225,7 +3289,7 @@ function draw(){
     drawTurrets();
     const deadCount = enemies.reduce((n,e)=>n+(e.hp<=0?1:0),0);
     corpseFastRender = deadCount > 14;
-    for(const e of enemies){ if(e.hp<=0 || playerSeesEnemy(e)) drawEnemy(e); }
+    for(const e of enemies){ if(!isOnScreen(e.x,e.y,190)) continue; if(e.hp<=0 || playerSeesEnemy(e)) drawEnemy(e); }
     corpseFastRender = false;
     drawGrenades();
     drawBullets();
@@ -3726,13 +3790,11 @@ function drawPlayer(){
   const sway = player.moving ? Math.sin(player.walk * 0.5) * 0.03 : 0;
   ctx.rotate(sway);
 
-  const asset = getSpriteAssetFor(player.characterKey, player.weaponType);
-  const pImg = (asset && asset.ready && asset.img) ? asset.img : (playerSpriteReady ? playerSprite : null);
-  if(pImg){
+  if(playerSpriteReady){
     ctx.imageSmoothingEnabled = true;
     try { ctx.imageSmoothingQuality = 'high'; } catch(e) {}
     ctx.filter = player.hiddenInShadow ? 'brightness(0.10) contrast(1.35) saturate(.25)' : 'brightness(0.40) contrast(1.18) saturate(.78)';
-    ctx.drawImage(pImg, -74, -74 + bob, 148, 148);
+    ctx.drawImage(playerSprite, -74, -74 + bob, 148, 148);
     ctx.filter='none';
   } else {
     ctx.fillStyle='#d9d9d9'; ctx.strokeStyle='#000'; ctx.lineWidth=4;
@@ -4162,7 +4224,7 @@ function drawPlayerLabels(){
 
 function drawInventoryBar(){
   if(state!=='play') return;
-  const size=96, gap=22, x=W/2 - size - gap/2, y=H-124;
+  const size=78, gap=18, x=W/2 - size - gap/2, y=H-104;
   ctx.save();
   ctx.textAlign='center';
   for(let i=0;i<2;i++){
@@ -4182,19 +4244,19 @@ function drawInventoryBar(){
     }
     if(key && loadoutDefs[key]){
       const d=loadoutDefs[key];
-      if(d.ready && d.imgPath) ctx.drawImage(d.img,sx+10,y+12,size-20,50); else drawItemIcon(key,sx+10,y+10,size-20,52);
+      if(d.ready && d.imgPath) ctx.drawImage(d.img,sx+8,y+10,size-16,40); else drawItemIcon(key,sx+8,y+8,size-16,45);
       ctx.font='15px Impact'; ctx.fillStyle='#fff';
-      ctx.fillText(d.name,sx+size/2,y+72);
+      ctx.fillText(d.name,sx+size/2,y+59);
       const st = key===player.weaponType ? {ammo:player.ammo,reserve:player.reserve} : (player.weaponState[key]||{ammo:weaponDefs[key].clip,reserve:weaponDefs[key].reserve});
       ctx.font='12px Arial Black'; ctx.fillStyle='rgba(255,255,255,.70)';
-      ctx.fillText((st.ammo|0)+'/'+(st.reserve|0),sx+size/2,y+88);
+      ctx.fillText(key==='grenade' ? ((st.ammo|0)+' ks') : ((st.ammo|0)+'/'+(st.reserve|0)),sx+size/2,y+73);
     } else {
       ctx.font='30px Impact'; ctx.fillStyle='rgba(255,255,255,.35)';
-      ctx.fillText('+',sx+size/2,y+58);
+      ctx.fillText('+',sx+size/2,y+48);
     }
   }
   ctx.font='12px Arial Black'; ctx.fillStyle='rgba(255,255,255,.55)';
-  ctx.fillText('+ / Ě',W/2,y-12);
+  ctx.fillText('+ / Ě PŘEPNOUT',W/2,y-12);
   ctx.restore();
 }
 function drawHUD(){
@@ -4208,8 +4270,8 @@ function drawHUD(){
   ctx.moveTo(34,28); ctx.lineTo(64,28); ctx.lineTo(70,62); ctx.lineTo(40,62); ctx.closePath();
   ctx.fill(); ctx.stroke();
   ctx.fillStyle='#444'; ctx.fillRect(45,62,12,8);
-  const ammoNow = String(player.ammo);
-  const ammoRes = '/ ' + String(player.reserve);
+  const ammoNow = player.weaponType==='grenade' ? String(player.ammo) : String(player.ammo);
+  const ammoRes = player.weaponType==='grenade' ? 'ks' : ('/ ' + String(player.reserve));
   ctx.font='26px Impact'; ctx.fillStyle='#fff';
   ctx.fillText(ammoNow, 88, 48);
   ctx.font='20px Impact'; ctx.fillStyle='#cfcfcf';
